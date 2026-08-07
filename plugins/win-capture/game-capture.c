@@ -899,6 +899,7 @@ static inline bool create_inject_process(struct game_capture *gc, const char *in
 	if (success) {
 		CloseHandle(pi.hThread);
 		gc->injector_process = pi.hProcess;
+		info("inject helper process started (pid %lu)", pi.dwProcessId);
 	} else {
 		warn("Failed to create inject helper process: %lu", GetLastError());
 	}
@@ -1738,6 +1739,7 @@ static void game_capture_tick(void *data, float seconds)
 
 		GetExitCodeProcess(gc->injector_process, &exit_code);
 		close_handle(&gc->injector_process);
+		info("inject helper process exited with code %lu", exit_code);
 
 		if (exit_code != 0) {
 			warn("inject process failed: %ld", (long)exit_code);
