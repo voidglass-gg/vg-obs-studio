@@ -278,7 +278,7 @@ public:
 	void Update(obs_data_t *settings);
 	void OnWindowChanged(obs_data_t *settings);
 
-	void Activate();
+	bool Activate();
 	void Deactivate();
 
 	void SetDefaultDevice(EDataFlow flow, ERole role, LPCWSTR id);
@@ -575,12 +575,13 @@ void WASAPISource::OnWindowChanged(obs_data_t *settings)
 		SetEvent(restartSignal);
 }
 
-void WASAPISource::Activate()
+bool WASAPISource::Activate()
 {
 	if (!reconnectThread.Valid()) {
 		ResetEvent(reconnectExitSignal);
 		reconnectThread = CreateThread(nullptr, 0, WASAPISource::ReconnectThread, this, 0, nullptr);
 	}
+	return reconnectThread.Valid();
 }
 
 void WASAPISource::Deactivate()
@@ -1400,6 +1401,15 @@ static void wasapi_reroute_audio(void *data, calldata_t *cd)
 	wasapi_source->SetRerouteTarget(target);
 }
 
+static void wasapi_enable_headless_reconnect(void *data, calldata_t *cd)
+{
+	// With no video tick, the owner of an audio-only source starts the
+	// same reconnect worker normally started by the activation callback.
+	// Source destruction stops and joins it in either case.
+	auto *source = static_cast<WASAPISource *>(data);
+	calldata_set_bool(cd, "enabled", source->Activate());
+}
+
 static void *CreateWASAPISource(obs_data_t *settings, obs_source_t *source, SourceType type)
 {
 	try {
@@ -1421,6 +1431,8 @@ static void *CreateWASAPISource(obs_data_t *settings, obs_source_t *source, Sour
 					wasapi_get_hooked, wasapi_source);
 				proc_handler_add(ph, "void reroute_audio(in ptr target)", wasapi_reroute_audio,
 						 wasapi_source);
+				proc_handler_add(ph, "void voidglass_enable_headless_reconnect(out bool enabled)",
+						 wasapi_enable_headless_reconnect, wasapi_source);
 			}
 			return wasapi_source;
 		}
