@@ -253,7 +253,7 @@ class WASAPISource {
 	void Initialize();
 	HWND GetCaptureWindow();
 	bool ConfirmHook(HWND window);
-	void ClearHook();
+	void ClearHook(bool notify);
 
 	bool TryInitialize();
 
@@ -922,7 +922,7 @@ bool WASAPISource::TryInitialize()
 	}
 
 	if (!success)
-		ClearHook();
+		ClearHook(false);
 	previouslyFailed = !success;
 	return success;
 }
@@ -1155,7 +1155,7 @@ DWORD WINAPI WASAPISource::CaptureThread(LPVOID param)
 
 		sig_count = _countof(inactive_sigs);
 		sigs = inactive_sigs;
-		source->ClearHook();
+		source->ClearHook(reconnect);
 
 		if (source->client) {
 			source->client->Stop();
@@ -1265,7 +1265,7 @@ void WASAPISource::OnSampleReady()
 	}
 
 	if (stop) {
-		ClearHook();
+		ClearHook(reconnect);
 		client->Stop();
 
 		capture.Clear();
@@ -1301,7 +1301,7 @@ bool WASAPISource::ConfirmHook(HWND window)
 	return true;
 }
 
-void WASAPISource::ClearHook()
+void WASAPISource::ClearHook(bool notify)
 {
 	bool was_hooked;
 	{
@@ -1310,7 +1310,7 @@ void WASAPISource::ClearHook()
 		hooked = false;
 		capture_window = nullptr;
 	}
-	if (!was_hooked)
+	if (!was_hooked || !notify)
 		return;
 
 	// Signal handlers can call get_hooked again.
