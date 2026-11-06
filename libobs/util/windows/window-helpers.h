@@ -13,6 +13,7 @@ enum window_priority {
 	WINDOW_PRIORITY_CLASS,
 	WINDOW_PRIORITY_TITLE,
 	WINDOW_PRIORITY_EXE,
+	WINDOW_PRIORITY_EXACT,
 };
 
 enum window_search_mode {
@@ -21,6 +22,7 @@ enum window_search_mode {
 };
 
 EXPORT bool ms_get_window_exe(struct dstr *name, HWND window);
+EXPORT bool ms_window_matches(HWND window, const char *window_class, const char *title, const char *exe);
 EXPORT void ms_get_window_title(struct dstr *name, HWND hwnd);
 EXPORT void ms_get_window_class(struct dstr *window_class, HWND hwnd);
 EXPORT bool ms_is_uwp_window(HWND hwnd);

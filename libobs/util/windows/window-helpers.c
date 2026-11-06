@@ -420,9 +420,33 @@ void ms_fill_window_list(obs_property_t *p, enum window_search_mode mode, add_wi
 	}
 }
 
+bool ms_window_matches(HWND window, const char *class, const char *title, const char *exe)
+{
+	if (!IsWindow(window) || !exe || !*exe)
+		return false;
+
+	struct dstr observed = {0};
+	bool matches = ms_get_window_exe(&observed, window) && dstr_cmpi(&observed, exe) == 0;
+	if (matches && class && *class) {
+		dstr_free(&observed);
+		ms_get_window_class(&observed, window);
+		matches = dstr_cmp(&observed, class) == 0;
+	}
+	if (matches && title && *title) {
+		dstr_free(&observed);
+		ms_get_window_title(&observed, window);
+		matches = dstr_cmp(&observed, title) == 0;
+	}
+	dstr_free(&observed);
+	return matches;
+}
+
 static int window_rating(HWND window, enum window_priority priority, const char *class, const char *title,
 			 const char *exe, bool uwp_window, bool generic_class)
 {
+	if (priority == WINDOW_PRIORITY_EXACT)
+		return ms_window_matches(window, class, title, exe) ? 0 : 0x7FFFFFFF;
+
 	struct dstr cur_class = {0};
 	struct dstr cur_title = {0};
 	struct dstr cur_exe = {0};
@@ -557,7 +581,7 @@ BOOL CALLBACK enum_windows_proc(HWND window, LPARAM lParam)
 HWND ms_find_window_top_level(enum window_search_mode mode, enum window_priority priority, const char *class,
 			      const char *title, const char *exe)
 {
-	if (!class)
+	if (!class && priority != WINDOW_PRIORITY_EXACT)
 		return NULL;
 
 	struct top_level_enum_data data;
@@ -566,8 +590,8 @@ HWND ms_find_window_top_level(enum window_search_mode mode, enum window_priority
 	data.class = class;
 	data.title = title;
 	data.exe = exe;
-	data.uwp_window = is_uwp_class(class);
-	data.generic_class = is_generic_class(class);
+	data.uwp_window = class && is_uwp_class(class);
+	data.generic_class = class && is_generic_class(class);
 	data.best_window = NULL;
 	data.best_rating = 0x7FFFFFFF;
 	EnumWindows(enum_windows_proc, (LPARAM)&data);
