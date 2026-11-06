@@ -222,6 +222,7 @@ static void *ffmpeg_mux_create(obs_data_t *settings, obs_output_t *output)
 {
 	struct ffmpeg_muxer *stream = bzalloc(sizeof(*stream));
 	stream->output = output;
+	stream->audio_only = !(obs_output_get_flags(output) & OBS_OUTPUT_VIDEO);
 
 	if (obs_output_get_flags(output) & OBS_OUTPUT_SERVICE)
 		stream->is_network = true;
@@ -233,7 +234,7 @@ static void *ffmpeg_mux_create(obs_data_t *settings, obs_output_t *output)
 	proc_handler_add(ph, "void split_file(out bool split_file_enabled)", split_file_proc, stream);
 
 #ifdef _WIN32
-	if (!stream->is_network && obs_data_get_bool(settings, "voidglass_exclusive")) {
+	if (!stream->is_network && (stream->audio_only || obs_data_get_bool(settings, "voidglass_exclusive"))) {
 		char *name = os_generate_uuid();
 		HANDLE event = CreateEventA(NULL, TRUE, FALSE, name);
 		const DWORD event_error = GetLastError();
@@ -632,6 +633,43 @@ static bool ffmpeg_mux_start(void *data)
 	return success;
 }
 
+#ifdef _WIN32
+static bool ffmpeg_mka_start(void *data)
+{
+	struct ffmpeg_muxer *stream = data;
+	obs_data_t *settings = obs_output_get_settings(stream->output);
+	const char *ext = strrchr(obs_data_get_string(settings, "path"), '.');
+	const char *error = NULL;
+
+	if (!ext || astrcmpi(ext, ".mka") != 0) {
+		error = "audio-only muxing requires an MKA destination";
+	} else {
+		size_t tracks = 0;
+		for (size_t slot = 0; slot < MAX_AUDIO_MIXES; slot++) {
+			obs_encoder_t *encoder = obs_output_get_audio_encoder(stream->output, slot);
+			if (!encoder)
+				continue;
+			const char *codec = obs_encoder_get_codec(encoder);
+			if (slot != tracks || !codec || strcmp(codec, "aac") != 0) {
+				error = "MKA output requires contiguous AAC slots starting at zero";
+				break;
+			}
+			tracks++;
+		}
+		if (!error && !tracks)
+			error = "MKA output requires at least one AAC encoder";
+	}
+
+	bool success = false;
+	if (error)
+		obs_output_set_last_error(stream->output, error);
+	else
+		success = ffmpeg_mux_start_internal(stream, settings);
+	obs_data_release(settings);
+	return success;
+}
+#endif
+
 int deactivate(struct ffmpeg_muxer *stream, int code)
 {
 	int ret = -1;
@@ -652,8 +690,13 @@ int deactivate(struct ffmpeg_muxer *stream, int code)
 			const bool opened = WaitForSingleObject(stream->file_opened_event, 0) == WAIT_OBJECT_0;
 			if (code || ret != FFM_SUCCESS || !dstr_is_empty(&stream->helper_error) ||
 			    !opened || !stream->helper_closed_file) {
-				if (dstr_is_empty(&stream->helper_error))
-					dstr_printf(&stream->helper_error, "mux helper did not finalize the file (exit code %d)", ret);
+				if (dstr_is_empty(&stream->helper_error)) {
+					if (stream->audio_only && !stream->sent_headers && !opened && !code && ret == FFM_ERROR)
+						dstr_copy(&stream->helper_error, "MKA stopped before its first media packet");
+					else
+						dstr_printf(&stream->helper_error, "mux helper did not finalize the file (exit code %d)",
+							    ret);
+				}
 				obs_output_set_last_error(stream->output, stream->helper_error.array);
 				voidglass_log(stream, opened ? "output.finalization.failed" : "output.native.error",
 					      stream->helper_error.array, ret);
@@ -873,7 +916,7 @@ bool send_headers(struct ffmpeg_muxer *stream)
 	obs_encoder_t *aencoder;
 	size_t idx = 0;
 
-	if (!send_video_headers(stream))
+	if (!stream->audio_only && !send_video_headers(stream))
 		return false;
 
 	do {
@@ -987,6 +1030,14 @@ static void ffmpeg_mux_data(void *data, struct encoder_packet *packet)
 		return;
 	}
 
+	/* Close the waiting helper without creating a header-only MKA when
+	 * the stop cutoff precedes the first AAC packet. */
+	if (stream->audio_only && !stream->sent_headers && stopping(stream) &&
+	    packet->sys_dts_usec >= stream->stop_ts) {
+		deactivate(stream, 0);
+		return;
+	}
+
 	if (stream->split_file && stream->mux_packets.num) {
 		int64_t pts_usec = packet_pts_usec(packet);
 		struct encoder_packet *first_pkt = stream->mux_packets.array;
@@ -1014,8 +1065,11 @@ static void ffmpeg_mux_data(void *data, struct encoder_packet *packet)
 	}
 
 	if (!stream->sent_headers) {
-		if (!send_headers(stream))
+		if (!send_headers(stream)) {
+			if (stream->audio_only && active(stream))
+				signal_failure(stream);
 			return;
+		}
 
 		stream->sent_headers = true;
 
@@ -1047,7 +1101,7 @@ static void ffmpeg_mux_data(void *data, struct encoder_packet *packet)
 
 	if (write_packet(stream, packet)) {
 #ifdef _WIN32
-		/* The interleaver owns the packet for this synchronous notification.
+		/* The encoder or interleaver owns this packet during the notification.
 		 * A successful pipe write is not proof of file finalization. */
 		if (stream->packet_observer)
 			stream->packet_observer(stream->packet_observer_data, packet);
@@ -1083,6 +1137,27 @@ struct obs_output_info ffmpeg_muxer = {
 	.get_total_bytes = ffmpeg_mux_total_bytes,
 	.get_properties = ffmpeg_mux_properties,
 };
+
+#ifdef _WIN32
+static const char *ffmpeg_mka_getname(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return "VoidGlass MKA (audio only)";
+}
+
+struct obs_output_info voidglass_mka_muxer = {
+	.id = "voidglass_mka_muxer",
+	.flags = OBS_OUTPUT_AUDIO | OBS_OUTPUT_ENCODED | OBS_OUTPUT_MULTI_TRACK_AUDIO,
+	.get_name = ffmpeg_mka_getname,
+	.create = ffmpeg_mux_create,
+	.destroy = ffmpeg_mux_destroy,
+	.start = ffmpeg_mka_start,
+	.stop = ffmpeg_mux_stop,
+	.encoded_packet = ffmpeg_mux_data,
+	.get_total_bytes = ffmpeg_mux_total_bytes,
+	.get_properties = ffmpeg_mux_properties,
+};
+#endif
 
 static int connect_time(struct ffmpeg_muxer *stream)
 {

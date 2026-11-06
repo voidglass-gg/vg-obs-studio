@@ -62,6 +62,7 @@ struct ffmpeg_muxer {
 	int64_t last_dts_usec;
 
 	bool is_network;
+	bool audio_only;
 	bool split_file;
 	bool allow_overwrite;
 #ifdef _WIN32
