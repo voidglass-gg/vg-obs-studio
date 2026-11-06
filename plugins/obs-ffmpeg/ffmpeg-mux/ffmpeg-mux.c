@@ -97,6 +97,7 @@ struct main_params {
 	int max_luminance;
 	char *acodec;
 	char *muxer_settings;
+	const char *file_open_event;
 	int codec_tag;
 };
 
@@ -177,7 +178,7 @@ static void free_avformat(struct ffmpeg_mux *ffm)
 	if (ffm->output) {
 		avcodec_free_context(&ffm->video_ctx);
 
-		if ((ffm->output->oformat->flags & AVFMT_NOFILE) == 0) {
+		if (ffm->output->pb) {
 			if (!ffmpeg_mux_is_network(ffm)) {
 				av_free(ffm->output->pb->buffer);
 				avio_context_free(&ffm->output->pb);
@@ -202,10 +203,25 @@ static void free_avformat(struct ffmpeg_mux *ffm)
 	ffm->num_audio_streams = 0;
 }
 
-static void ffmpeg_mux_free(struct ffmpeg_mux *ffm)
+static bool ffmpeg_mux_free(struct ffmpeg_mux *ffm)
 {
+	const bool exclusive = ffm->params.file_open_event != NULL;
+	bool success = true;
 	if (ffm->initialized) {
-		av_write_trailer(ffm->output);
+		const int ret = av_write_trailer(ffm->output);
+		if (exclusive) {
+			if (ret < 0) {
+				fprintf(stderr, "voidglass mux error: write trailer: %s\n", av_err2str(ret));
+				success = false;
+			}
+
+			AVIOContext *io = ffm->output->pb;
+			avio_flush(io);
+			if (io->error < 0) {
+				fprintf(stderr, "voidglass mux error: flush AVIO: %s\n", av_err2str(io->error));
+				success = false;
+			}
+		}
 	}
 
 	// If we're writing to a file with the deque, shut it
@@ -218,6 +234,8 @@ static void ffmpeg_mux_free(struct ffmpeg_mux *ffm)
 		os_event_signal(ffm->io.new_data_available_event);
 		pthread_mutex_unlock(&ffm->io.data_mutex);
 		pthread_join(ffm->io.io_thread, NULL);
+		if (exclusive && os_atomic_load_bool(&ffm->io.output_error))
+			success = false;
 
 		// Cleanup everything else
 		os_event_destroy(ffm->io.new_data_available_event);
@@ -249,6 +267,7 @@ static void ffmpeg_mux_free(struct ffmpeg_mux *ffm)
 	av_packet_free(&ffm->packet);
 
 	memset(ffm, 0, sizeof(*ffm));
+	return success;
 }
 
 static bool get_opt_str(int *p_argc, char ***p_argv, char **str, const char *opt)
@@ -412,6 +431,8 @@ static bool init_params(int *argc, char ***argv, struct main_params *params, str
 	av_log_set_callback(ffmpeg_log_callback);
 
 	get_opt_str(argc, argv, &params->muxer_settings, "muxer settings");
+	if (*argc > 0)
+		params->file_open_event = **argv;
 
 	return true;
 }
@@ -604,18 +625,19 @@ static void ffmpeg_mux_header(struct ffmpeg_mux *ffm, uint8_t *data, struct ffm_
 static size_t safe_read(void *vdata, size_t size)
 {
 	uint8_t *data = vdata;
-	size_t total = size;
+	size_t read_size = 0;
 
 	while (size > 0) {
 		size_t in_size = fread(data, 1, size, stdin);
 		if (in_size == 0)
-			return 0;
+			break;
 
+		read_size += in_size;
 		size -= in_size;
 		data += in_size;
 	}
 
-	return total;
+	return read_size;
 }
 
 static bool ffmpeg_mux_get_header(struct ffmpeg_mux *ffm)
@@ -668,10 +690,10 @@ static void *ffmpeg_mux_io_thread(void *data)
 	// Chunk collects the writes into a larger batch
 	size_t chunk_used = 0;
 
+	const bool exclusive = ffm->params.file_open_event != NULL;
 	unsigned char *chunk = malloc(CHUNK_SIZE);
 	if (!chunk) {
-		os_atomic_set_bool(&ffm->io.output_error, true);
-		fprintf(stderr, "Error allocating memory for output\n");
+		fprintf(stderr, "voidglass mux error: allocate output buffer\n");
 		goto error;
 	}
 
@@ -764,7 +786,10 @@ static void *ffmpeg_mux_io_thread(void *data)
 
 			// Seek if we need to
 			if (want_seek) {
-				os_fseeki64(ffm->io.output_file, next_seek_position, SEEK_SET);
+				if (os_fseeki64(ffm->io.output_file, next_seek_position, SEEK_SET) != 0 && exclusive) {
+					fprintf(stderr, "voidglass mux error: seek: %s\n", strerror(errno));
+					goto error;
+				}
 
 				// Update the next virtual position, making sure to take
 				// into account the size of the chunk we're about to write.
@@ -775,8 +800,7 @@ static void *ffmpeg_mux_io_thread(void *data)
 
 			// Write the current chunk to the output file
 			if (fwrite(chunk, chunk_used, 1, ffm->io.output_file) != 1) {
-				os_atomic_set_bool(&ffm->io.output_error, true);
-				fprintf(stderr, "Error writing to '%s', %s\n", ffm->params.printable_file.array,
+				fprintf(stderr, "voidglass mux error: write '%s': %s\n", ffm->params.printable_file.array,
 					strerror(errno));
 				goto error;
 			}
@@ -790,11 +814,23 @@ static void *ffmpeg_mux_io_thread(void *data)
 			break;
 	}
 
-error:
-	if (chunk)
-		free(chunk);
+	if (exclusive && fflush(ffm->io.output_file) != 0) {
+		fprintf(stderr, "voidglass mux error: flush file: %s\n", strerror(errno));
+		goto error;
+	}
+	goto close_file;
 
-	fclose(ffm->io.output_file);
+error:
+	pthread_mutex_lock(&ffm->io.data_mutex);
+	os_atomic_set_bool(&ffm->io.output_error, true);
+	os_event_signal(ffm->io.buffer_space_available_event);
+	pthread_mutex_unlock(&ffm->io.data_mutex);
+close_file:
+	free(chunk);
+	if (fclose(ffm->io.output_file) != 0 && exclusive) {
+		fprintf(stderr, "voidglass mux error: close file: %s\n", strerror(errno));
+		os_atomic_set_bool(&ffm->io.output_error, true);
+	}
 	return NULL;
 }
 
@@ -825,12 +861,12 @@ static int ffmpeg_mux_write_av_buffer(void *opaque, uint8_t *buf, int buf_size)
 {
 	struct ffmpeg_mux *ffm = opaque;
 
-	// If the output thread failed, signal that back up the stack
-	if (os_atomic_load_bool(&ffm->io.output_error))
-		return -1;
-
 	for (;;) {
 		pthread_mutex_lock(&ffm->io.data_mutex);
+		if (os_atomic_load_bool(&ffm->io.output_error)) {
+			pthread_mutex_unlock(&ffm->io.data_mutex);
+			return AVERROR(EIO);
+		}
 
 		// Avoid unbounded growth of the deque, cap to 256 MB
 		if (ffm->io.data.capacity >= 256 * 1048576 &&
@@ -864,10 +900,69 @@ static int ffmpeg_mux_write_av_buffer(void *opaque, uint8_t *buf, int buf_size)
 	return buf_size;
 }
 
+static FILE *open_local_file(struct ffmpeg_mux *ffm)
+{
+	if (!ffm->params.file_open_event)
+		return os_fopen(ffm->params.file, "wb");
+
+#ifdef _WIN32
+	HANDLE opened = OpenEventA(EVENT_MODIFY_STATE, FALSE, ffm->params.file_open_event);
+	if (!opened) {
+		fprintf(stderr, "voidglass mux error: open creation event: %lu\n", GetLastError());
+		return NULL;
+	}
+
+	FILE *file = os_fopen(ffm->params.file, "wbx");
+	if (!file) {
+		fprintf(stderr, "voidglass mux error: create '%s' exclusively: %s\n", ffm->params.printable_file.array,
+			strerror(errno));
+	} else if (!SetEvent(opened)) {
+		fprintf(stderr, "voidglass mux error: signal creation event: %lu\n", GetLastError());
+		fclose(file);
+		file = NULL;
+	} else {
+		fprintf(stderr, "exclusive file opened\n");
+	}
+	CloseHandle(opened);
+	return file;
+#else
+	return NULL;
+#endif
+}
+
+static bool start_file_io(struct ffmpeg_mux *ffm)
+{
+	if (pthread_mutex_init(&ffm->io.data_mutex, NULL) != 0)
+		return false;
+	if (os_event_init(&ffm->io.buffer_space_available_event, OS_EVENT_TYPE_AUTO) != 0)
+		goto destroy_mutex;
+	if (os_event_init(&ffm->io.new_data_available_event, OS_EVENT_TYPE_AUTO) != 0)
+		goto destroy_buffer_event;
+
+	deque_reserve(&ffm->io.data, 1048576);
+	if (pthread_create(&ffm->io.io_thread, NULL, ffmpeg_mux_io_thread, ffm) != 0) {
+		deque_free(&ffm->io.data);
+		os_event_destroy(ffm->io.new_data_available_event);
+		goto destroy_buffer_event;
+	}
+	ffm->io.active = true;
+	return true;
+
+destroy_buffer_event:
+	os_event_destroy(ffm->io.buffer_space_available_event);
+destroy_mutex:
+	pthread_mutex_destroy(&ffm->io.data_mutex);
+	return false;
+}
+
 static inline int open_output_file(struct ffmpeg_mux *ffm)
 {
 	const AVOutputFormat *format = ffm->output->oformat;
 	int ret;
+	if (ffm->params.file_open_event && ((format->flags & AVFMT_NOFILE) || ffmpeg_mux_is_network(ffm))) {
+		fprintf(stderr, "voidglass mux error: exclusive creation requires a local file\n");
+		return FFM_ERROR;
+	}
 
 	if ((format->flags & AVFMT_NOFILE) == 0) {
 		if (!ffmpeg_mux_is_network(ffm)) {
@@ -877,31 +972,28 @@ static inline int open_output_file(struct ffmpeg_mux *ffm)
 			// stalls when recording.
 
 			// We're in charge of managing the actual file now
-			ffm->io.output_file = os_fopen(ffm->params.file, "wb");
+			ffm->io.output_file = open_local_file(ffm);
 			if (!ffm->io.output_file) {
 				fprintf(stderr, "Couldn't open '%s', %s\n", ffm->params.printable_file.array,
 					strerror(errno));
 				return FFM_ERROR;
 			}
 
-			// Start at 1MB, this can grow up to 256 MB depending
-			// how fast data is going in and out (limited in
-			// ffmpeg_mux_write_av_buffer)
-			deque_reserve(&ffm->io.data, 1048576);
-
-			pthread_mutex_init(&ffm->io.data_mutex, NULL);
-
-			os_event_init(&ffm->io.buffer_space_available_event, OS_EVENT_TYPE_AUTO);
-			os_event_init(&ffm->io.new_data_available_event, OS_EVENT_TYPE_AUTO);
-
-			pthread_create(&ffm->io.io_thread, NULL, ffmpeg_mux_io_thread, ffm);
+			if (!start_file_io(ffm)) {
+				fprintf(stderr, "voidglass mux error: start output I/O thread\n");
+				fclose(ffm->io.output_file);
+				return FFM_ERROR;
+			}
 
 			unsigned char *avio_ctx_buffer = av_malloc(AVIO_BUFFER_SIZE);
-
-			ffm->output->pb = avio_alloc_context(avio_ctx_buffer, AVIO_BUFFER_SIZE, 1, ffm, NULL,
-							     ffmpeg_mux_write_av_buffer, ffmpeg_mux_seek_av_buffer);
-
-			ffm->io.active = true;
+			if (avio_ctx_buffer)
+				ffm->output->pb = avio_alloc_context(avio_ctx_buffer, AVIO_BUFFER_SIZE, 1, ffm, NULL,
+								     ffmpeg_mux_write_av_buffer, ffmpeg_mux_seek_av_buffer);
+			if (!ffm->output->pb) {
+				av_free(avio_ctx_buffer);
+				fprintf(stderr, "voidglass mux error: allocate AVIO context\n");
+				return FFM_ERROR;
+			}
 		} else {
 			ret = avio_open(&ffm->output->pb, ffm->params.file, AVIO_FLAG_WRITE);
 			if (ret < 0) {
@@ -932,7 +1024,8 @@ static inline int open_output_file(struct ffmpeg_mux *ffm)
 
 	ret = avformat_write_header(ffm->output, &dict);
 	if (ret < 0) {
-		fprintf(stderr, "Error opening '%s': %s", ffm->params.printable_file.array, av_err2str(ret));
+		fprintf(stderr, "%sError opening '%s': %s\n", ffm->params.file_open_event ? "voidglass mux error: " : "",
+			ffm->params.printable_file.array, av_err2str(ret));
 
 		av_dict_free(&dict);
 
@@ -979,18 +1072,10 @@ static int ffmpeg_mux_init_context(struct ffmpeg_mux *ffm)
 		return FFM_ERROR;
 	}
 
-	if (!init_streams(ffm)) {
-		free_avformat(ffm);
+	if (!init_streams(ffm))
 		return FFM_ERROR;
-	}
 
-	ret = open_output_file(ffm);
-	if (ret != FFM_SUCCESS) {
-		free_avformat(ffm);
-		return ret;
-	}
-
-	return FFM_SUCCESS;
+	return open_output_file(ffm);
 }
 
 static int ffmpeg_mux_init_internal(struct ffmpeg_mux *ffm, int argc, char *argv[])
@@ -1032,10 +1117,8 @@ static inline int get_index(struct ffmpeg_mux *ffm, struct ffm_packet_info *info
 		if (ffm->video_stream) {
 			return ffm->video_stream->id;
 		}
-	} else {
-		if ((int)info->index < ffm->num_audio_streams) {
-			return ffm->audio_infos[info->index].stream->id;
-		}
+	} else if (info->type == FFM_PACKET_AUDIO && info->index < (uint32_t)ffm->num_audio_streams) {
+		return ffm->audio_infos[info->index].stream->id;
 	}
 
 	return -1;
@@ -1075,6 +1158,10 @@ static inline bool ffmpeg_mux_packet(struct ffmpeg_mux *ffm, uint8_t *buf, struc
 
 	/* The muxer might not support video/audio, or multiple audio tracks */
 	if (idx == -1) {
+		if (ffm->params.file_open_event) {
+			fprintf(stderr, "voidglass mux error: packet has no muxed stream\n");
+			return false;
+		}
 		return true;
 	}
 
@@ -1092,13 +1179,11 @@ static inline bool ffmpeg_mux_packet(struct ffmpeg_mux *ffm, uint8_t *buf, struc
 	int ret = av_interleaved_write_frame(ffm->output, ffm->packet);
 
 	/* Treat "Invalid data found when processing input" and "Invalid argument" as non-fatal */
-	if (ret == AVERROR_INVALIDDATA || ret == -EINVAL) {
+	if (!ffm->params.file_open_event && (ret == AVERROR_INVALIDDATA || ret == -EINVAL))
 		return true;
-	}
 
-	if (ret < 0) {
-		fprintf(stderr, "av_interleaved_write_frame failed: %d: %s\n", ret, av_err2str(ret));
-	}
+	if (ret < 0)
+		fprintf(stderr, "voidglass mux error: write media packet: %s\n", av_err2str(ret));
 
 	return ret >= 0;
 }
@@ -1174,22 +1259,37 @@ int main(int argc, char *argv[])
 		return ret;
 	}
 
-	while (!fail && safe_read(&info, sizeof(info)) == sizeof(info)) {
+	const bool exclusive = ffm.params.file_open_event != NULL;
+	while (!fail) {
+		size_t size = safe_read(&info, sizeof(info));
+		if (size != sizeof(info)) {
+			if (exclusive && (size != 0 || ferror(stdin))) {
+				fprintf(stderr, "voidglass mux error: read media packet header\n");
+				fail = true;
+			}
+			break;
+		}
 		if (info.type == FFM_PACKET_CHANGE_FILE) {
-			fail = !read_change_file(&ffm, info.size, &rb_filename, argc, argv);
+			if (exclusive) {
+				fprintf(stderr, "voidglass mux error: unexpected output file change\n");
+				fail = true;
+			} else {
+				fail = !read_change_file(&ffm, info.size, &rb_filename, argc, argv);
+			}
 			continue;
 		}
 
 		resize_buf_resize(&rb, info.size);
-
 		if (safe_read(rb.buf, info.size) == info.size) {
 			fail = !ffmpeg_mux_packet(&ffm, rb.buf, &info);
 		} else {
+			fprintf(stderr, "voidglass mux error: incomplete media packet\n");
 			fail = true;
 		}
 	}
-
-	ffmpeg_mux_free(&ffm);
+	const bool finalized = ffmpeg_mux_free(&ffm);
+	if (exclusive && !fail && finalized)
+		fprintf(stderr, "exclusive file closed\n");
 	resize_buf_free(&rb);
 	resize_buf_free(&rb_filename);
 
@@ -1198,5 +1298,5 @@ int main(int argc, char *argv[])
 		free(argv[i]);
 	free(argv);
 #endif
-	return 0;
+	return exclusive && (fail || !finalized) ? FFM_ERROR : FFM_SUCCESS;
 }

@@ -102,6 +102,8 @@ os_process_pipe_t *os_process_pipe_create(const char *cmd_line, const char *type
 	}
 
 	if (!create_pipe(&err_input, &err_output)) {
+		CloseHandle(output);
+		CloseHandle(input);
 		return NULL;
 	}
 
@@ -134,6 +136,8 @@ os_process_pipe_t *os_process_pipe_create(const char *cmd_line, const char *type
 	return pp;
 
 error:
+	CloseHandle(err_output);
+	CloseHandle(err_input);
 	CloseHandle(output);
 	CloseHandle(input);
 	return NULL;
@@ -199,6 +203,16 @@ os_process_pipe_t *os_process_pipe_create2(const os_process_args_t *args, const 
 	return ret;
 }
 
+bool os_process_pipe_close_input(os_process_pipe_t *pp)
+{
+	if (!pp || pp->read_pipe)
+		return false;
+
+	HANDLE input = pp->handle;
+	pp->handle = NULL;
+	return !input || CloseHandle(input);
+}
+
 int os_process_pipe_destroy(os_process_pipe_t *pp)
 {
 	int ret = 0;
@@ -206,12 +220,14 @@ int os_process_pipe_destroy(os_process_pipe_t *pp)
 	if (pp) {
 		DWORD code;
 
-		CloseHandle(pp->handle);
+		if (pp->handle)
+			CloseHandle(pp->handle);
 		CloseHandle(pp->handle_err);
 
-		WaitForSingleObject(pp->process, INFINITE);
-		if (GetExitCodeProcess(pp->process, &code))
+		if (WaitForSingleObject(pp->process, INFINITE) == WAIT_OBJECT_0 && GetExitCodeProcess(pp->process, &code))
 			ret = (int)code;
+		else
+			ret = -1;
 
 		CloseHandle(pp->process);
 		bfree(pp);

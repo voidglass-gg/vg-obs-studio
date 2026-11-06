@@ -19,6 +19,7 @@
 #include "obs-ffmpeg-formats.h"
 
 #ifdef _WIN32
+#include <windows.h>
 #include "util/windows/win-version.h"
 #endif
 
@@ -61,6 +62,120 @@ static inline void replay_buffer_clear(struct ffmpeg_muxer *stream)
 	stream->keyframes = 0;
 }
 
+#ifdef _WIN32
+static void voidglass_log(struct ffmpeg_muxer *stream, const char *event, const char *message, int exit_code)
+{
+	struct dstr json = {0};
+	dstr_printf(&json, "{%s}", stream->voidglass_log_context.array ? stream->voidglass_log_context.array : "");
+	obs_data_t *fields = obs_data_create_from_json(json.array);
+	dstr_free(&json);
+	if (!fields)
+		fields = obs_data_create();
+
+	obs_data_set_string(fields, "event", event);
+	if (message)
+		obs_data_set_string(fields, "message", message);
+	if (strcmp(event, "output.stderr") != 0 && strcmp(event, "output.stderr.drained") != 0) {
+		char code[24];
+		snprintf(code, sizeof(code), "%d", exit_code);
+		obs_data_set_string(fields, "exitCode", code);
+	}
+	if (strcmp(event, "output.finalization.failed") == 0) {
+		obs_data_set_string(fields, "phase", "finalization");
+		obs_data_set_string(fields, "operation", "helper_close");
+		obs_data_set_string(fields, "nativeCode", "-8");
+	} else if (strcmp(event, "output.native.error") == 0) {
+		obs_data_set_string(fields, "phase", "preparation");
+		obs_data_set_string(fields, "operation", "helper_open");
+		obs_data_set_string(fields, "nativeCode", "-8");
+	}
+	blog(LOG_INFO, "[VoidGlass-event] %s", obs_data_get_json(fields));
+	obs_data_release(fields);
+}
+
+static void voidglass_stderr_line(struct ffmpeg_muxer *stream, const char *line)
+{
+	static const char prefix[] = "voidglass mux error: ";
+	if (strcmp(line, "exclusive file closed") == 0)
+		stream->helper_closed_file = true;
+	if (dstr_is_empty(&stream->helper_error) && strncmp(line, prefix, sizeof(prefix) - 1) == 0)
+		dstr_copy(&stream->helper_error, line + sizeof(prefix) - 1);
+	voidglass_log(stream, "output.stderr", line, 0);
+}
+
+static void *voidglass_drain_stderr(void *data)
+{
+	struct ffmpeg_muxer *stream = data;
+	uint8_t buffer[1024];
+	char line[2048];
+	size_t size, used = 0;
+
+	while ((size = os_process_pipe_read_err(stream->pipe, buffer, sizeof(buffer))) != 0) {
+		for (size_t i = 0; i < size; i++) {
+			if (buffer[i] == '\r')
+				continue;
+			if (buffer[i] == '\n') {
+				if (used) {
+					line[used] = 0;
+					voidglass_stderr_line(stream, line);
+					used = 0;
+				}
+			} else if (used < sizeof(line) - 1) {
+				line[used++] = (char)buffer[i];
+			}
+		}
+	}
+	if (used) {
+		line[used] = 0;
+		voidglass_stderr_line(stream, line);
+	}
+	voidglass_log(stream, "output.stderr.drained", NULL, 0);
+	return NULL;
+}
+
+static int voidglass_finish_helper(struct ffmpeg_muxer *stream)
+{
+	if (!stream->pipe)
+		return FFM_ERROR;
+
+	/* Close stdin first so the helper can finish writing and close stderr. */
+	const bool input_closed = os_process_pipe_close_input(stream->pipe);
+	if (stream->stderr_thread_started) {
+		pthread_join(stream->stderr_thread, NULL);
+		stream->stderr_thread_started = false;
+	}
+	int code = os_process_pipe_destroy(stream->pipe);
+	stream->pipe = NULL;
+	if (!input_closed && dstr_is_empty(&stream->helper_error))
+		dstr_copy(&stream->helper_error, "could not close mux helper stdin");
+	voidglass_log(stream, "output.helper.exit", NULL, code);
+	return code;
+}
+
+static void voidglass_file_opened_handle(void *data, calldata_t *cd)
+{
+	struct ffmpeg_muxer *stream = data;
+	HANDLE process = GetCurrentProcess(), handle = NULL;
+	if (!DuplicateHandle(process, stream->file_opened_event, process, &handle, SYNCHRONIZE, FALSE, 0))
+		handle = NULL;
+	calldata_set_ptr(cd, "handle", handle);
+}
+
+static void voidglass_set_packet_observer(void *data, calldata_t *cd)
+{
+	struct ffmpeg_muxer *stream = data;
+
+	/* The callback is immutable while the interleaver can call it. */
+	pthread_mutex_lock(&stream->observer_mutex);
+	if (!stream->exclusive_started) {
+		stream->packet_observer =
+			(void (*)(void *, const struct encoder_packet *))calldata_ptr(cd, "callback");
+		stream->packet_observer_data = calldata_ptr(cd, "param");
+	}
+	pthread_mutex_unlock(&stream->observer_mutex);
+}
+#endif
+
 static void ffmpeg_mux_destroy(void *data)
 {
 	struct ffmpeg_muxer *stream = data;
@@ -73,6 +188,17 @@ static void ffmpeg_mux_destroy(void *data)
 	da_free(stream->mux_packets);
 	deque_free(&stream->packets);
 
+#ifdef _WIN32
+	if (stream->file_opened_event) {
+		if (stream->pipe)
+			voidglass_finish_helper(stream);
+		CloseHandle(stream->file_opened_event);
+		pthread_mutex_destroy(&stream->observer_mutex);
+		bfree(stream->file_opened_event_name);
+		dstr_free(&stream->voidglass_log_context);
+		dstr_free(&stream->helper_error);
+	}
+#endif
 	os_process_pipe_destroy(stream->pipe);
 	dstr_free(&stream->path);
 	dstr_free(&stream->printable_path);
@@ -106,7 +232,30 @@ static void *ffmpeg_mux_create(obs_data_t *settings, obs_output_t *output)
 	proc_handler_t *ph = obs_output_get_proc_handler(output);
 	proc_handler_add(ph, "void split_file(out bool split_file_enabled)", split_file_proc, stream);
 
+#ifdef _WIN32
+	if (!stream->is_network && obs_data_get_bool(settings, "voidglass_exclusive")) {
+		char *name = os_generate_uuid();
+		HANDLE event = CreateEventA(NULL, TRUE, FALSE, name);
+		const DWORD event_error = GetLastError();
+		if (!event || event_error == ERROR_ALREADY_EXISTS || pthread_mutex_init(&stream->observer_mutex, NULL) != 0) {
+			if (event)
+				CloseHandle(event);
+			bfree(name);
+			bfree(stream);
+			return NULL;
+		}
+
+		stream->file_opened_event = event;
+		stream->file_opened_event_name = name;
+		dstr_copy(&stream->voidglass_log_context, obs_data_get_string(settings, "voidglass_log_context"));
+		proc_handler_add(ph, "void voidglass_file_opened_handle(out ptr handle)", voidglass_file_opened_handle,
+				 stream);
+		proc_handler_add(ph, "void voidglass_set_packet_observer(ptr callback, ptr param)",
+				 voidglass_set_packet_observer, stream);
+	}
+#else
 	UNUSED_PARAMETER(settings);
+#endif
 	return stream;
 }
 
@@ -301,6 +450,10 @@ static void build_command_line(struct ffmpeg_muxer *stream, os_process_args_t **
 
 	add_stream_key(*args, stream);
 	add_muxer_params(*args, stream);
+#ifdef _WIN32
+	if (stream->file_opened_event)
+		os_process_args_add_arg(*args, stream->file_opened_event_name);
+#endif
 }
 
 void start_pipe(struct ffmpeg_muxer *stream, const char *path)
@@ -311,7 +464,7 @@ void start_pipe(struct ffmpeg_muxer *stream, const char *path)
 	os_process_args_destroy(args);
 }
 
-static void set_file_not_readable_error(struct ffmpeg_muxer *stream, obs_data_t *settings, const char *path)
+static void set_file_not_readable_error(struct ffmpeg_muxer *stream, const char *path)
 {
 	struct dstr error_message;
 	dstr_init_copy(&error_message, obs_module_text("UnableToWritePath"));
@@ -327,7 +480,6 @@ static void set_file_not_readable_error(struct ffmpeg_muxer *stream, obs_data_t 
 	dstr_replace(&error_message, "%1", path);
 	obs_output_set_last_error(stream->output, error_message.array);
 	dstr_free(&error_message);
-	obs_data_release(settings);
 }
 
 inline static void ts_offset_clear(struct ffmpeg_muxer *stream)
@@ -407,7 +559,22 @@ static inline bool ffmpeg_mux_start_internal(struct ffmpeg_muxer *stream, obs_da
 
 	ts_offset_clear(stream);
 
-	if (!stream->is_network) {
+#ifdef _WIN32
+	const bool exclusive = stream->file_opened_event != NULL;
+	if (exclusive) {
+		pthread_mutex_lock(&stream->observer_mutex);
+		const bool can_start = !stream->exclusive_started && !stream->split_file && stream->packet_observer;
+		stream->exclusive_started = true;
+		pthread_mutex_unlock(&stream->observer_mutex);
+		if (!can_start) {
+			obs_output_set_last_error(stream->output, "exclusive muxing requires a new output, one file and a packet observer");
+			return false;
+		}
+	}
+#else
+	const bool exclusive = false;
+#endif
+	if (!stream->is_network && !exclusive) {
 		/* ensure output path is writable to avoid generic error
 		 * message.
 		 *
@@ -415,7 +582,7 @@ static inline bool ffmpeg_mux_start_internal(struct ffmpeg_muxer *stream, obs_da
 		 * errors back */
 		FILE *test_file = os_fopen(path, "wb");
 		if (!test_file) {
-			set_file_not_readable_error(stream, settings, path);
+			set_file_not_readable_error(stream, path);
 			return false;
 		}
 
@@ -430,6 +597,18 @@ static inline bool ffmpeg_mux_start_internal(struct ffmpeg_muxer *stream, obs_da
 		warn("Failed to create process pipe");
 		return false;
 	}
+
+#ifdef _WIN32
+	if (exclusive) {
+		if (pthread_create(&stream->stderr_thread, NULL, voidglass_drain_stderr, stream) != 0) {
+			os_process_pipe_destroy(stream->pipe);
+			stream->pipe = NULL;
+			obs_output_set_last_error(stream->output, "could not drain mux helper stderr");
+			return false;
+		}
+		stream->stderr_thread_started = true;
+	}
+#endif
 
 	/* write headers and start capture */
 	os_atomic_set_bool(&stream->active, true);
@@ -467,8 +646,25 @@ int deactivate(struct ffmpeg_muxer *stream, int code)
 	}
 
 	if (active(stream)) {
-		ret = os_process_pipe_destroy(stream->pipe);
-		stream->pipe = NULL;
+#ifdef _WIN32
+		if (stream->file_opened_event) {
+			ret = voidglass_finish_helper(stream);
+			const bool opened = WaitForSingleObject(stream->file_opened_event, 0) == WAIT_OBJECT_0;
+			if (code || ret != FFM_SUCCESS || !dstr_is_empty(&stream->helper_error) ||
+			    !opened || !stream->helper_closed_file) {
+				if (dstr_is_empty(&stream->helper_error))
+					dstr_printf(&stream->helper_error, "mux helper did not finalize the file (exit code %d)", ret);
+				obs_output_set_last_error(stream->output, stream->helper_error.array);
+				voidglass_log(stream, opened ? "output.finalization.failed" : "output.native.error",
+					      stream->helper_error.array, ret);
+				code = OBS_OUTPUT_ENCODE_ERROR;
+			}
+		} else
+#endif
+		{
+			ret = os_process_pipe_destroy(stream->pipe);
+			stream->pipe = NULL;
+		}
 
 		os_atomic_set_bool(&stream->active, false);
 		os_atomic_set_bool(&stream->sent_headers, false);
@@ -512,6 +708,13 @@ void ffmpeg_mux_stop(void *data, uint64_t ts)
 
 static void signal_failure(struct ffmpeg_muxer *stream)
 {
+#ifdef _WIN32
+	if (stream->file_opened_event) {
+		os_atomic_set_bool(&stream->capturing, false);
+		deactivate(stream, OBS_OUTPUT_ENCODE_ERROR);
+		return;
+	}
+#endif
 	char error[1024];
 	int ret;
 	int code;
@@ -842,7 +1045,14 @@ static void ffmpeg_mux_data(void *data, struct encoder_packet *packet)
 	if (stream->split_file)
 		ts_offset_update(stream, packet);
 
-	write_packet(stream, packet);
+	if (write_packet(stream, packet)) {
+#ifdef _WIN32
+		/* The interleaver owns the packet for this synchronous notification.
+		 * A successful pipe write is not proof of file finalization. */
+		if (stream->packet_observer)
+			stream->packet_observer(stream->packet_observer_data, packet);
+#endif
+	}
 }
 
 static obs_properties_t *ffmpeg_mux_properties(void *unused)

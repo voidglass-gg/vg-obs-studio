@@ -31,6 +31,10 @@ typedef struct os_process_args os_process_args_t;
 EXPORT os_process_pipe_t *os_process_pipe_create(const char *cmd_line, const char *type);
 EXPORT os_process_pipe_t *os_process_pipe_create2(const os_process_args_t *args, const char *type);
 EXPORT int os_process_pipe_destroy(os_process_pipe_t *pp);
+#ifdef _WIN32
+/* Send EOF to the child while leaving its stderr available for draining. */
+EXPORT bool os_process_pipe_close_input(os_process_pipe_t *pp);
+#endif
 
 EXPORT size_t os_process_pipe_read(os_process_pipe_t *pp, uint8_t *data, size_t len);
 EXPORT size_t os_process_pipe_read_err(os_process_pipe_t *pp, uint8_t *data, size_t len);
