@@ -1148,6 +1148,11 @@ static void get_selected_window(struct game_capture *gc)
 		wchar_t class_w[512];
 		os_utf8_to_wcs(gc->class.array, 0, class_w, 512);
 		window = FindWindowW(class_w, NULL);
+	} else if (gc->priority == WINDOW_PRIORITY_EXE && !dstr_is_empty(&gc->executable)) {
+		/* An executable-only selector has no class or title. The window
+		 * search needs empty strings for these optional criteria. */
+		window = ms_find_window(INCLUDE_MINIMIZED, gc->priority, gc->class.array ? gc->class.array : "",
+					gc->title.array ? gc->title.array : "", gc->executable.array);
 	} else {
 		window = ms_find_window(INCLUDE_MINIMIZED, gc->priority, gc->class.array, gc->title.array,
 					gc->executable.array);
