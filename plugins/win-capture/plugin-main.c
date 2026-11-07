@@ -130,9 +130,16 @@ bool obs_module_load(void)
 
 	win8_or_above = ver.major > 6 || (ver.major == 6 && ver.minor >= 2);
 
-	obs_enter_graphics();
-	graphics_uses_d3d11 = gs_get_device_type() == GS_DEVICE_DIRECT3D_11;
-	obs_leave_graphics();
+	struct obs_video_info video_info;
+	if (obs_get_video_info(&video_info)) {
+		obs_enter_graphics();
+		graphics_uses_d3d11 = gs_get_device_type() == GS_DEVICE_DIRECT3D_11;
+		obs_leave_graphics();
+	} else {
+		/* A cold Windows Recorder registers capture types before its
+		 * first session initializes the D3D11 backend. */
+		graphics_uses_d3d11 = true;
+	}
 
 	if (graphics_uses_d3d11)
 		wgc_supported = win_version_compare(&ver, &win1903) >= 0;

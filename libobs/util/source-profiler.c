@@ -232,7 +232,7 @@ void source_profiler_gpu_enable(bool enable)
 
 void source_profiler_reset_video(struct obs_video_info *ovi)
 {
-	double fps = ceil((double)ovi->fps_num / (double)ovi->fps_den);
+	double fps = ovi ? ceil((double)ovi->fps_num / (double)ovi->fps_den) : 0;
 	profiler_samples = (uint64_t)(fps * 5);
 
 	/* This is fine because the video thread won't be running at this point */

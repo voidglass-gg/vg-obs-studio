@@ -696,8 +696,6 @@ static int obs_init_video(struct obs_video_info *ovi)
 		return OBS_VIDEO_FAIL;
 	if (pthread_mutex_init(&video->encoder_group_mutex, NULL) < 0)
 		return OBS_VIDEO_FAIL;
-	if (pthread_mutex_init(&video->mixes_mutex, NULL) < 0)
-		return OBS_VIDEO_FAIL;
 
 	/* Reset main canvas mix first so it remains first in the rendering order. */
 	if (!obs_canvas_reset_video_internal(obs->data.main_canvas, ovi))
@@ -833,9 +831,6 @@ static void obs_free_video(void)
 	if (num_views > 0)
 		blog(LOG_WARNING, "Number of remaining views: %ld", num_views);
 	pthread_mutex_unlock(&obs->video.mixes_mutex);
-
-	pthread_mutex_destroy(&obs->video.mixes_mutex);
-	pthread_mutex_init_value(&obs->video.mixes_mutex);
 
 	for (size_t i = 0; i < obs->video.ready_encoder_groups.num; i++) {
 		obs_weak_encoder_release(obs->video.ready_encoder_groups.array[i]);
@@ -1226,6 +1221,7 @@ static bool obs_init(const char *locale, const char *module_config_path, profile
 	pthread_mutex_init_value(&obs->audio.task_mutex);
 	pthread_mutex_init_value(&obs->video.task_mutex);
 	pthread_mutex_init_value(&obs->video.encoder_group_mutex);
+	/* The audio thread reads video mix roots even between video resets. */
 	pthread_mutex_init_value(&obs->video.mixes_mutex);
 
 	obs->name_store_owned = !store;
@@ -1432,6 +1428,7 @@ void obs_shutdown(void)
 	obs_free_data();
 	obs_free_audio();
 	obs_free_video();
+	pthread_mutex_destroy(&obs->video.mixes_mutex);
 	os_task_queue_destroy(obs->destruction_task_thread);
 	obs_free_hotkeys();
 	obs_free_graphics();
@@ -1529,12 +1526,18 @@ int obs_reset_video(struct obs_video_info *ovi)
 	if (obs_video_active())
 		return OBS_VIDEO_CURRENTLY_ACTIVE;
 
-	if (!size_valid(ovi->output_width, ovi->output_height) || !size_valid(ovi->base_width, ovi->base_height))
+	if (ovi && (!size_valid(ovi->output_width, ovi->output_height) || !size_valid(ovi->base_width, ovi->base_height)))
 		return OBS_VIDEO_INVALID_PARAM;
 
 	stop_video();
 	obs_free_canvas_mixes();
 	obs_free_video();
+
+	if (!ovi) {
+		source_profiler_reset_video(NULL);
+		obs_free_graphics();
+		return OBS_VIDEO_SUCCESS;
+	}
 
 	/* align to multiple-of-two and SSE alignment sizes */
 	ovi->output_width &= 0xFFFFFFFC;
