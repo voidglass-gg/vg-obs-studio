@@ -285,7 +285,7 @@ static void add_video_encoder_params(struct ffmpeg_muxer *stream, os_process_arg
 {
 	obs_data_t *settings = obs_encoder_get_settings(vencoder);
 	int bitrate = (int)obs_data_get_int(settings, "bitrate");
-	video_t *video = obs_get_video();
+	video_t *video = obs_encoder_video(vencoder);
 	const struct video_output_info *info = video_output_get_info(video);
 
 	int codec_tag = (int)obs_data_get_int(settings, "codec_type");
