@@ -853,20 +853,24 @@ static void obs_free_graphics(void)
 		gs_enter_context(video->graphics);
 
 		gs_texture_destroy(video->transparent_texture);
-
+		video->transparent_texture = NULL;
 		gs_samplerstate_destroy(video->point_sampler);
+		video->point_sampler = NULL;
 
-		gs_effect_destroy(video->default_effect);
-		gs_effect_destroy(video->default_rect_effect);
-		gs_effect_destroy(video->opaque_effect);
-		gs_effect_destroy(video->solid_effect);
-		gs_effect_destroy(video->conversion_effect);
-		gs_effect_destroy(video->bicubic_effect);
-		gs_effect_destroy(video->repeat_effect);
-		gs_effect_destroy(video->lanczos_effect);
-		gs_effect_destroy(video->area_effect);
-		gs_effect_destroy(video->bilinear_lowres_effect);
-		video->default_effect = NULL;
+		gs_effect_t **effects[] = {
+			&video->default_effect, &video->default_rect_effect, &video->opaque_effect,
+			&video->solid_effect, &video->conversion_effect, &video->bicubic_effect,
+			&video->repeat_effect, &video->lanczos_effect, &video->area_effect,
+			&video->bilinear_lowres_effect, &video->premultiplied_alpha_effect,
+			&video->deinterlace_discard_effect, &video->deinterlace_discard_2x_effect,
+			&video->deinterlace_linear_effect, &video->deinterlace_linear_2x_effect,
+			&video->deinterlace_blend_effect, &video->deinterlace_blend_2x_effect,
+			&video->deinterlace_yadif_effect, &video->deinterlace_yadif_2x_effect,
+		};
+		for (size_t i = 0; i < sizeof(effects) / sizeof(*effects); i++) {
+			gs_effect_destroy(*effects[i]);
+			*effects[i] = NULL;
+		}
 
 		gs_leave_context();
 
