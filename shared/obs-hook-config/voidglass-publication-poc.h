@@ -71,7 +71,6 @@ void vg_pub_shutdown(void);
 void vg_pub_dxgi_installed(void);
 void vg_pub_capture_init(void *device, void *context, HWND hwnd, uint32_t map_id);
 void vg_pub_capture_free(void);
-bool vg_pub_copy_allowed(void);
 void vg_pub_submitted(void);
 #ifdef __cplusplus
 }

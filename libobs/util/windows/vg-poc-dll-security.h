@@ -189,8 +189,11 @@ static __inline bool vg_poc_bootstrap(const char *role, const wchar_t *sha_env, 
 		CloseHandle(output);
 		return false;
 	}
-	int count = snprintf(line, sizeof(line), "%lu\t%s\tpolicy=1\tPreferSystem32Images=1\tarch=AMD64\t%s\t%s\n",
-			     GetCurrentProcessId(), role, hash_utf8, utf8);
+	FILETIME creation, exit_time, kernel_time, user_time;
+	if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit_time, &kernel_time, &user_time)) { CloseHandle(output); return false; }
+	uint64_t created = ((uint64_t)creation.dwHighDateTime << 32) | creation.dwLowDateTime;
+	int count = snprintf(line, sizeof(line), "%lu\t%s\tpolicy=1\tPreferSystem32Images=1\tarch=AMD64\t%s\t%s\tcreation=%llu\n",
+			     GetCurrentProcessId(), role, hash_utf8, utf8, (unsigned long long)created);
 	DWORD written = 0;
 	bool ok = count > 0 && WriteFile(output, line, (DWORD)count, &written, NULL) && written == (DWORD)count;
 	CloseHandle(output);
