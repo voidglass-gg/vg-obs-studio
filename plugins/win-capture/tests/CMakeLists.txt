@@ -6,3 +6,8 @@ add_executable(voidglass-hook-contract hook-contract.cpp)
 target_include_directories(voidglass-hook-contract PRIVATE "${CMAKE_SOURCE_DIR}/libobs")
 target_link_libraries(voidglass-hook-contract PRIVATE OBS::hook-config bcrypt.lib)
 target_compile_features(voidglass-hook-contract PRIVATE cxx_std_17)
+
+add_executable(voidglass-provenance-cache provenance-cache.cpp)
+target_include_directories(voidglass-provenance-cache PRIVATE .. "${CMAKE_SOURCE_DIR}/libobs")
+target_link_libraries(voidglass-provenance-cache PRIVATE OBS::hook-config bcrypt.lib)
+target_compile_features(voidglass-provenance-cache PRIVATE cxx_std_17)

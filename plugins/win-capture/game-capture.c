@@ -1,6 +1,7 @@
 #include <voidglass-publication.h>
 #include <tlhelp32.h>
 #include "voidglass-module-files.h"
+#include "voidglass-provenance-cache.h"
 #include <inttypes.h>
 #include <obs-module.h>
 #include <obs-hotkey.h>
@@ -179,7 +180,8 @@ struct game_capture {
 	HANDLE publication_map;
 	const vg_pub_shared *publication_view;
 	uint64_t publication_instance, publication_heartbeat;
-	int publication_provenance;
+	struct vg_provenance_cache publication_provenance;
+	vg_dll_file *publication_reference;
 	char *publication_hook_path;
 	char publication_hook_sha256[65];
 	HANDLE texture_mutexes[2];
@@ -318,18 +320,33 @@ static inline float hook_rate_to_float(enum hook_rate rate)
 	}
 }
 
-static void stop_capture(struct game_capture *gc)
+static void game_capture_clear_publication_proof(struct game_capture *gc)
+{
+	gc->publication_instance = gc->publication_heartbeat = 0;
+	bfree(gc->publication_hook_path);
+	gc->publication_hook_path = NULL;
+	gc->publication_hook_sha256[0] = 0;
+}
+
+static void game_capture_reset_publication(struct game_capture *gc)
 {
 	if (gc->publication_view) {
 		UnmapViewOfFile(gc->publication_view);
 		gc->publication_view = NULL;
 	}
 	close_handle(&gc->publication_map);
-	gc->publication_instance = gc->publication_heartbeat = 0;
-	gc->publication_provenance = VG_HOOK_UNKNOWN;
-	bfree(gc->publication_hook_path);
-	gc->publication_hook_path = NULL;
-	gc->publication_hook_sha256[0] = 0;
+	game_capture_clear_publication_proof(gc);
+	if (gc->publication_reference) {
+		vg_dll_close(gc->publication_reference);
+		bfree(gc->publication_reference);
+		gc->publication_reference = NULL;
+	}
+	memset(&gc->publication_provenance, 0, sizeof(gc->publication_provenance));
+}
+
+static void stop_capture(struct game_capture *gc)
+{
+	game_capture_reset_publication(gc);
 	ipc_pipe_server_free(&gc->pipe);
 
 	if (gc->hook_stop) {
@@ -551,22 +568,29 @@ static void game_capture_get_hooked(void *data, calldata_t *cd)
 
 /* Best-effort file provenance, NOT an attestation of a potentially hostile process.
  * Serialize this procedure with tick/destruction on the OBS graphics thread. */
-static int game_capture_hook_provenance(struct game_capture *gc)
+static bool game_capture_prepare_hook_reference(void *data)
 {
-	if (gc->publication_provenance != VG_HOOK_UNKNOWN)
-		return gc->publication_provenance;
-	bfree(gc->publication_hook_path);
-	gc->publication_hook_path = NULL;
-	gc->publication_hook_sha256[0] = 0;
+	struct game_capture *gc = data;
 	char *path = obs_module_file("graphics-hook64.dll");
-	vg_dll_file *expected = bzalloc(sizeof(*expected)), *loaded = bzalloc(sizeof(*loaded));
-	HANDLE snapshot = INVALID_HANDLE_VALUE;
+	if (gc->publication_reference) {
+		vg_dll_close(gc->publication_reference);
+		bfree(gc->publication_reference);
+	}
+	gc->publication_reference = bzalloc(sizeof(*gc->publication_reference));
+	const bool valid = gc->publication_reference &&
+			   vg_module_open(path, IMAGE_FILE_MACHINE_AMD64, true, gc->publication_reference);
+	bfree(path);
+	return valid;
+}
+
+static int game_capture_observe_hook(void *data)
+{
+	struct game_capture *gc = data;
+	game_capture_clear_publication_proof(gc);
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, gc->process_id);
 	int result = VG_HOOK_UNKNOWN, found = 0;
-	if (!expected || !loaded || !vg_module_open(path, IMAGE_FILE_MACHINE_AMD64, true, expected))
-		goto done;
-	snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, gc->process_id);
 	if (snapshot == INVALID_HANDLE_VALUE)
-		goto done;
+		return result;
 	MODULEENTRY32W entry = {0};
 	entry.dwSize = sizeof(entry);
 	if (Module32FirstW(snapshot, &entry))
@@ -574,34 +598,16 @@ static int game_capture_hook_provenance(struct game_capture *gc)
 			if (_wcsicmp(entry.szModule, L"graphics-hook64.dll"))
 				continue;
 			++found;
-			char *observed = NULL;
-			os_wcs_to_utf8_ptr(entry.szExePath, 0, &observed);
-			const bool verified = observed &&
-					      vg_module_open(observed, IMAGE_FILE_MACHINE_AMD64, true, loaded) &&
-					      !_wcsicmp(loaded->path, expected->path) &&
-					      !memcmp(loaded->sha256, expected->sha256, 32);
-			if (verified)
-				vg_dll_hex(loaded->sha256, gc->publication_hook_sha256);
-			vg_dll_close(loaded);
+			result = vg_provenance_file(gc->publication_reference, entry.szExePath);
 			bfree(gc->publication_hook_path);
-			gc->publication_hook_path = observed;
-			result = verified ? VG_HOOK_RUNTIME : VG_HOOK_EXTERNAL;
+			gc->publication_hook_path = NULL;
+			os_wcs_to_utf8_ptr(entry.szExePath, 0, &gc->publication_hook_path);
 		} while (Module32NextW(snapshot, &entry));
 	if (GetLastError() != ERROR_NO_MORE_FILES || found != 1)
 		result = VG_HOOK_UNKNOWN;
-done:
-	if (snapshot != INVALID_HANDLE_VALUE)
-		CloseHandle(snapshot);
-	if (expected)
-		vg_dll_close(expected);
-	if (loaded)
-		vg_dll_close(loaded);
-	bfree(expected);
-	bfree(loaded);
-	bfree(path);
-	if (result != VG_HOOK_RUNTIME)
-		gc->publication_hook_sha256[0] = 0;
-	gc->publication_provenance = result;
+	CloseHandle(snapshot);
+	if (result == VG_HOOK_RUNTIME)
+		vg_dll_hex(gc->publication_reference->sha256, gc->publication_hook_sha256);
 	return result;
 }
 
@@ -611,17 +617,34 @@ static void game_capture_get_publication(void *data, calldata_t *cd)
 	int status = VG_PUB_UNAVAILABLE, provenance = VG_HOOK_UNKNOWN;
 	vg_pub_payload value = {0};
 	uint64_t creation = 0;
-	if (!gc || !gc->target_process || WaitForSingleObject(gc->target_process, 0) != WAIT_TIMEOUT)
+	if (!gc)
 		goto done;
+	if (!gc->target_process || WaitForSingleObject(gc->target_process, 0) != WAIT_TIMEOUT ||
+	    GetProcessId(gc->target_process) != gc->process_id || !(creation = vg_pub_creation(gc->target_process))) {
+		game_capture_reset_publication(gc);
+		goto done;
+	}
 	if (!gc->process_is_64bit) {
+		game_capture_reset_publication(gc);
 		status = VG_PUB_ABSENT;
 		goto done;
 	}
-	provenance = game_capture_hook_provenance(gc);
-	creation = vg_pub_creation(gc->target_process);
-	if (!creation)
-		goto done;
+	struct vg_provenance_key key = {
+		.pid = gc->process_id,
+		.creation = creation,
+		.process = (uintptr_t)gc->target_process,
+		.window = (uintptr_t)gc->window,
+		.map_id = gc->global_hook_info ? gc->global_hook_info->map_id : 0,
+		.capturing = gc->capturing,
+	};
+	if (vg_provenance_target_changed(&gc->publication_provenance, &key))
+		game_capture_reset_publication(gc);
 	status = vg_pub_open_reader(gc->process_id, creation, &gc->publication_map, &gc->publication_view);
+	key.channel = gc->publication_view != NULL;
+	if (vg_provenance_select(&gc->publication_provenance, &key))
+		game_capture_clear_publication_proof(gc);
+	provenance = vg_provenance_poll(&gc->publication_provenance, GetTickCount64(), gc,
+					game_capture_prepare_hook_reference, game_capture_observe_hook);
 	if (status != VG_PUB_VALID)
 		goto done;
 	status = vg_pub_read(gc->publication_view, sizeof(vg_pub_shared), &value);

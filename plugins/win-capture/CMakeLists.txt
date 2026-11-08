@@ -50,6 +50,7 @@ target_sources(
     plugin-main.c
     window-capture.c
     voidglass-module-files.h
+    voidglass-provenance-cache.h
 )
 
 target_compile_definitions(
