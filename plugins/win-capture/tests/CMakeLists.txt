@@ -1,0 +1,8 @@
+add_executable(voidglass-publication-safety publication-safety.cpp)
+target_include_directories(voidglass-publication-safety PRIVATE ../graphics-hook)
+target_link_libraries(voidglass-publication-safety PRIVATE OBS::hook-config)
+target_compile_features(voidglass-publication-safety PRIVATE cxx_std_17)
+add_executable(voidglass-hook-contract hook-contract.cpp)
+target_include_directories(voidglass-hook-contract PRIVATE "${CMAKE_SOURCE_DIR}/libobs")
+target_link_libraries(voidglass-hook-contract PRIVATE OBS::hook-config bcrypt.lib)
+target_compile_features(voidglass-hook-contract PRIVATE cxx_std_17)

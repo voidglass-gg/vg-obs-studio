@@ -1,3 +1,4 @@
+#include <voidglass-publication.h>
 #include <d3d10_1.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -331,6 +332,7 @@ bool hook_dxgi(void)
 	const LONG error = DetourTransactionCommit();
 	const bool success = error == NO_ERROR;
 	if (success) {
+		vg_pub_dxgi_installed();
 		hlog("Hooked IDXGISwapChain::Present");
 		hlog("Hooked IDXGISwapChain::ResizeBuffers");
 		if (RealPresent1)

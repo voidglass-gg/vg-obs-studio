@@ -1,3 +1,4 @@
+#include <voidglass-publication.h>
 #include <d3d11.h>
 #include <dxgi.h>
 
@@ -37,6 +38,7 @@ static struct d3d11_data data = {};
 
 void d3d11_free(void)
 {
+	vg_pub_capture_free();
 	capture_free();
 
 	if (data.using_shtex) {
@@ -207,6 +209,7 @@ static bool d3d11_shtex_init(HWND window)
 		return false;
 	}
 
+	vg_pub_capture_init(data.device, data.context, window, global_hook_info->map_id);
 	hlog("d3d11 shared texture capture successful");
 	return true;
 }
@@ -249,6 +252,7 @@ static inline void d3d11_shtex_capture(ID3D11Resource *backbuffer)
 {
 	if (data.texture) {
 		d3d11_copy_texture(data.texture, backbuffer);
+		vg_pub_submitted();
 	}
 }
 

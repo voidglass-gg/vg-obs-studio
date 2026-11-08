@@ -1,3 +1,4 @@
+#include <voidglass-publication.h>
 #include <windows.h>
 #include <psapi.h>
 #include <inttypes.h>
@@ -412,6 +413,7 @@ static inline void capture_loop(void)
 		 * a small sleep interval in case the thread needs to stop */
 		if (n % 100 == 0)
 			attempt_hook();
+		vg_pub_tick();
 		Sleep(40);
 	}
 }
@@ -424,7 +426,9 @@ static DWORD WINAPI main_capture_thread(HANDLE thread_handle)
 		return 0;
 	}
 
+	vg_pub_start();
 	capture_loop();
+	vg_pub_shutdown();
 	return 0;
 }
 

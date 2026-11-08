@@ -1,3 +1,4 @@
+#include <util/windows/voidglass-dll-security.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
@@ -85,7 +86,33 @@ static int inject_helper(wchar_t *argv[], const wchar_t *dll)
 		return INJECT_ERROR_INVALID_PARAMS;
 	}
 
-	return use_safe_inject ? inject_library_safe(id, dll) : inject_library_full(id, dll);
+	wchar_t directory[VG_DLL_PATH_CAPACITY];
+	vg_dll_file checked = {0};
+#if defined(_M_ARM64)
+	const WORD machine = IMAGE_FILE_MACHINE_ARM64;
+#elif defined(_WIN64)
+	const WORD machine = IMAGE_FILE_MACHINE_AMD64;
+#else
+	const WORD machine = IMAGE_FILE_MACHINE_I386;
+#endif
+#ifdef VOIDGLASS_RUNTIME_HOOKS
+	if (!vg_dll_process_directory(directory))
+		return INJECT_ERROR_INVALID_PARAMS;
+#else
+	/* Explicit upstream deployment: accept its absolute Hook path, never CWD. */
+	if (!vg_dll_absolute(dll) || wcscpy_s(directory, VG_DLL_PATH_CAPACITY, dll))
+		return INJECT_ERROR_INVALID_PARAMS;
+	wchar_t *slash = wcsrchr(directory, L'\\');
+	if (!slash)
+		return INJECT_ERROR_INVALID_PARAMS;
+	*slash = 0;
+#endif
+	if (!vg_dll_open(dll, directory, machine, true, &checked))
+		return INJECT_ERROR_INVALID_PARAMS;
+	/* The command-line protocol and compatibility injection are unchanged. */
+	int result = use_safe_inject ? inject_library_safe(id, checked.path) : inject_library_full(id, checked.path);
+	vg_dll_close(&checked);
+	return result;
 }
 
 int main(void)
@@ -97,6 +124,8 @@ int main(void)
 	int ret = INJECT_ERROR_INVALID_PARAMS;
 
 	SetErrorMode(SEM_FAILCRITICALERRORS);
+	if (!vg_dll_harden_process())
+		return INJECT_ERROR_INVALID_PARAMS;
 	load_debug_privilege();
 
 	pCommandLineW = GetCommandLineW();

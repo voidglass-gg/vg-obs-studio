@@ -84,17 +84,19 @@ void *os_dlopen(const char *path)
 	 * libraries that are within the library's own directory */
 	wpath_slash = wcsrchr(wpath, L'/');
 	if (wpath_slash) {
-		*wpath_slash = 0;
-		SetDllDirectoryW(wpath);
-		*wpath_slash = L'/';
+		wchar_t fullpath[MAX_PATH];
+		const DWORD length = GetFullPathNameW(wpath, MAX_PATH, fullpath, NULL);
+		if (length && length < MAX_PATH) {
+			h_library = LoadLibraryExW(fullpath, NULL,
+						   LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+		} else if (length >= MAX_PATH) {
+			SetLastError(ERROR_INSUFFICIENT_BUFFER);
+		}
+	} else {
+		h_library = LoadLibraryExW(wpath, NULL, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
 	}
 
-	h_library = LoadLibraryW(wpath);
-
 	bfree(wpath);
-
-	if (wpath_slash)
-		SetDllDirectoryW(NULL);
 
 	if (!h_library) {
 		DWORD error = GetLastError();
