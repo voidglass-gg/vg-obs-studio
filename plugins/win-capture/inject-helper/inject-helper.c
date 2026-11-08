@@ -1,3 +1,4 @@
+#include <util/windows/vg-poc-dll-security.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
@@ -85,7 +86,14 @@ static int inject_helper(wchar_t *argv[], const wchar_t *dll)
 		return INJECT_ERROR_INVALID_PARAMS;
 	}
 
-	return use_safe_inject ? inject_library_safe(id, dll) : inject_library_full(id, dll);
+	HANDLE checked = vg_poc_verified_file(dll, L"VG_POC_HOOK_SHA256");
+	if (checked == INVALID_HANDLE_VALUE || !use_safe_inject) {
+		if (checked != INVALID_HANDLE_VALUE) CloseHandle(checked);
+		return INJECT_ERROR_INVALID_PARAMS;
+	}
+	int result = inject_library_safe(id, dll);
+	CloseHandle(checked);
+	return result;
 }
 
 int main(void)
@@ -97,6 +105,8 @@ int main(void)
 	int ret = INJECT_ERROR_INVALID_PARAMS;
 
 	SetErrorMode(SEM_FAILCRITICALERRORS);
+	if (!vg_poc_bootstrap("inject-helper64", L"VG_POC_INJECT_SHA256", NULL))
+		return INJECT_ERROR_INVALID_PARAMS;
 	load_debug_privilege();
 
 	pCommandLineW = GetCommandLineW();

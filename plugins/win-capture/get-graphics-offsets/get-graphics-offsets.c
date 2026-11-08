@@ -1,3 +1,4 @@
+#include <util/windows/vg-poc-dll-security.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <windows.h>
@@ -17,6 +18,8 @@ int main(int argc, char *argv[])
 	wc.lpszClassName = DUMMY_WNDCLASS;
 
 	SetErrorMode(SEM_FAILCRITICALERRORS);
+	if (!vg_poc_bootstrap("graphics-offsets64", L"VG_POC_OFFSETS_SHA256", NULL))
+		return -1;
 
 	if (!RegisterClassA(&wc)) {
 		printf("failed to register '%s'\n", DUMMY_WNDCLASS);

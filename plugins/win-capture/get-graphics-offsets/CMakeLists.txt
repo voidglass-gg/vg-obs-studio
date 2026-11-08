@@ -14,6 +14,8 @@ target_sources(
   PRIVATE d3d8-offsets.cpp d3d9-offsets.cpp dxgi-offsets.cpp get-graphics-offsets.c get-graphics-offsets.h
 )
 
+target_link_libraries(get-graphics-offsets PRIVATE bcrypt.lib)
+
 target_link_libraries(
   get-graphics-offsets
   PRIVATE OBS::hook-config OBS::d3d8-api d3d9.lib dxgi.lib d3d11.lib

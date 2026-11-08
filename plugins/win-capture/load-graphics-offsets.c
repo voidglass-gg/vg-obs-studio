@@ -1,3 +1,4 @@
+#include <util/windows/vg-poc-dll-security.h>
 #include <obs-module.h>
 #include <util/windows/win-version.h>
 #include <util/platform.h>
@@ -142,6 +143,8 @@ failed:
 bool load_graphics_offsets(bool is32bit, bool use_hook_address_cache, const char *config_path)
 {
 	char *offset_exe_path = NULL;
+	wchar_t *checked_path = NULL;
+	HANDLE checked_file = INVALID_HANDLE_VALUE;
 	struct dstr config_ini = {0};
 	struct dstr offset_exe = {0};
 	struct dstr str = {0};
@@ -160,6 +163,12 @@ bool load_graphics_offsets(bool is32bit, bool use_hook_address_cache, const char
 	dstr_cat(&offset_exe, is32bit ? "32.exe" : "64.exe");
 	offset_exe_path = obs_module_file(offset_exe.array);
 
+	if (is32bit || !vg_poc_absolute_path(offset_exe_path) || !os_utf8_to_wcs_ptr(offset_exe_path, 0, &checked_path)) {
+		bfree(offset_exe_path);
+		goto error;
+	}
+	checked_file = vg_poc_verified_file(checked_path, L"VG_POC_OFFSETS_SHA256");
+	if (checked_file == INVALID_HANDLE_VALUE) { bfree(offset_exe_path); goto error; }
 	dstr_init_move_array(&cmd, offset_exe_path);
 	dstr_insert_ch(&cmd, 0, '\"');
 	dstr_cat(&cmd, "\"");
@@ -202,6 +211,8 @@ bool load_graphics_offsets(bool is32bit, bool use_hook_address_cache, const char
 	os_process_pipe_destroy(pp);
 
 error:
+	if (checked_file != INVALID_HANDLE_VALUE) CloseHandle(checked_file);
+	bfree(checked_path);
 	dstr_free(&offset_exe);
 	dstr_free(&str);
 	dstr_free(&cmd);

@@ -1,3 +1,4 @@
+#include <voidglass-publication-poc.h>
 #include <inttypes.h>
 #include <obs-module.h>
 #include <obs-hotkey.h>
@@ -12,6 +13,7 @@
 #include <ipc-util/pipe.h>
 #include <util/windows/obfuscate.h>
 #include "inject-library.h"
+#include <util/windows/vg-poc-dll-security.h>
 #include "compat-helpers.h"
 #include "graphics-hook-info.h"
 #include "graphics-hook-ver.h"
@@ -173,6 +175,9 @@ struct game_capture {
 	HANDLE hook_data_map;
 	HANDLE global_hook_info_map;
 	HANDLE target_process;
+	HANDLE publication_map;
+	const vg_pub_shared *publication_view;
+	uint64_t publication_instance, publication_heartbeat;
 	HANDLE texture_mutexes[2];
 	wchar_t *app_sid;
 	int retrying;
@@ -311,6 +316,9 @@ static inline float hook_rate_to_float(enum hook_rate rate)
 
 static void stop_capture(struct game_capture *gc)
 {
+	if (gc->publication_view) { UnmapViewOfFile(gc->publication_view); gc->publication_view = NULL; }
+	close_handle(&gc->publication_map);
+	gc->publication_instance = gc->publication_heartbeat = 0;
 	ipc_pipe_server_free(&gc->pipe);
 
 	if (gc->hook_stop) {
@@ -530,6 +538,51 @@ static void game_capture_get_hooked(void *data, calldata_t *cd)
 	}
 }
 
+/* Experimental procedure: caller must serialize with tick/destruction on OBS graphics. */
+static void game_capture_get_publication(void *data, calldata_t *cd)
+{
+    struct game_capture *gc = data;
+    int status = VG_PUB_UNAVAILABLE;
+    vg_pub_payload value = {0};
+    uint64_t creation = 0;
+    if (!gc || !gc->target_process || WaitForSingleObject(gc->target_process, 0) != WAIT_TIMEOUT)
+        goto done;
+    creation = vg_pub_creation(gc->target_process);
+    if (!creation) goto done;
+    if (!gc->publication_map) {
+        wchar_t name[128]; vg_pub_name(name, gc->process_id, creation);
+        gc->publication_map = OpenFileMappingW(FILE_MAP_READ, FALSE, name);
+        if (!gc->publication_map) { status = GetLastError() == ERROR_FILE_NOT_FOUND ? VG_PUB_ABSENT : VG_PUB_UNAVAILABLE; goto done; }
+        gc->publication_view = MapViewOfFile(gc->publication_map, FILE_MAP_READ, 0, 0, sizeof(vg_pub_shared));
+        if (!gc->publication_view) { status = VG_PUB_INCOMPATIBLE; goto done; }
+    }
+    status = vg_pub_read(gc->publication_view, sizeof(vg_pub_shared), &value);
+    if (status != VG_PUB_VALID) goto done;
+    if (value.pid != gc->process_id || value.creation != creation || !value.instance || !value.frequency || !value.heartbeat_qpc ||
+        (value.native_initialized && gc->capturing && (!gc->global_hook_info || value.map_id != gc->global_hook_info->map_id))) {
+        status = VG_PUB_UNAVAILABLE; goto done;
+    }
+    /* A newly attached mapping must demonstrate liveness; a leftover name is insufficient. */
+    if (gc->publication_instance != value.instance) {
+        gc->publication_instance = value.instance; gc->publication_heartbeat = value.heartbeat_qpc;
+        status = VG_PUB_UNAVAILABLE; goto done;
+    }
+    if (value.heartbeat_qpc <= gc->publication_heartbeat || vg_pub_qpc() < value.heartbeat_qpc ||
+        vg_pub_qpc() - value.heartbeat_qpc > value.frequency * 2) { status = VG_PUB_UNAVAILABLE; goto done; }
+ done:
+    calldata_set_int(cd, "status", status);
+    calldata_set_bool(cd, "connected", gc && gc->capturing);
+    if (status != VG_PUB_VALID) return;
+#define VG_PUB_FIELD(name) calldata_set_int(cd, #name, (long long)value.name)
+    VG_PUB_FIELD(capability); VG_PUB_FIELD(pid); VG_PUB_FIELD(creation); VG_PUB_FIELD(instance);
+    VG_PUB_FIELD(generation); VG_PUB_FIELD(hwnd); VG_PUB_FIELD(map_id); VG_PUB_FIELD(dxgi_installed);
+    VG_PUB_FIELD(native_initialized); VG_PUB_FIELD(submitted); VG_PUB_FIELD(completed);
+    VG_PUB_FIELD(heartbeat_qpc); VG_PUB_FIELD(frequency); VG_PUB_FIELD(initialized_qpc);
+    VG_PUB_FIELD(first_submitted_qpc); VG_PUB_FIELD(first_completed_qpc); VG_PUB_FIELD(last_completed_qpc);
+    VG_PUB_FIELD(signal_ticks); VG_PUB_FIELD(signal_max_ticks); VG_PUB_FIELD(device_flags); VG_PUB_FIELD(error);
+#undef VG_PUB_FIELD
+}
+
 static void game_capture_update(void *data, obs_data_t *settings)
 {
 	struct game_capture *gc = data;
@@ -613,6 +666,7 @@ static void *game_capture_create(obs_data_t *settings, obs_source_t *source)
 	signal_handler_add(sh, "void hooked(ptr source, string title, string class, string executable)");
 
 	proc_handler_t *ph = obs_source_get_proc_handler(source);
+	proc_handler_add(ph, "void get_capture_publication(out int status)", game_capture_get_publication, gc);
 	proc_handler_add(ph,
 			 "void get_hooked(out bool hooked, out string title, out string class, out string executable)",
 			 game_capture_get_hooked, gc);
@@ -879,16 +933,34 @@ static inline bool hook_direct(struct game_capture *gc, const char *hook_path_re
 static inline bool create_inject_process(struct game_capture *gc, const char *inject_path, const char *hook_dll)
 {
 	wchar_t *command_line_w = malloc(4096 * sizeof(wchar_t));
-	wchar_t *inject_path_w;
-	wchar_t *hook_dll_w;
+	wchar_t *inject_path_w = NULL;
+	wchar_t *hook_dll_w = NULL;
 	bool anti_cheat = use_anticheat(gc);
 	PROCESS_INFORMATION pi = {0};
 	STARTUPINFO si = {0};
 	bool success = false;
+	HANDLE verified_helper = INVALID_HANDLE_VALUE, verified_hook = INVALID_HANDLE_VALUE;
 
-	os_utf8_to_wcs_ptr(inject_path, 0, &inject_path_w);
-	os_utf8_to_wcs_ptr(hook_dll, 0, &hook_dll_w);
+	/* PR #13688: both CreateProcess and the hook argument receive absolute paths. */
+	char *abs_inject_path = NULL;
+	char *abs_hook_dll = NULL;
+#ifdef VG_GAMEPUB_POC
+	/* The P0 data root is supplied as an absolute, manifest-checked private path. */
+	if (!vg_poc_absolute_path(inject_path) || !vg_poc_absolute_path(hook_dll))
+		goto cleanup;
+#endif
+	abs_inject_path = os_get_abs_path_ptr(inject_path);
+	abs_hook_dll = os_get_abs_path_ptr(hook_dll);
+	if (!command_line_w || !abs_inject_path || !abs_hook_dll ||
+	    !os_utf8_to_wcs_ptr(abs_inject_path, 0, &inject_path_w) ||
+	    !os_utf8_to_wcs_ptr(abs_hook_dll, 0, &hook_dll_w))
+		goto cleanup;
 
+	verified_helper = vg_poc_verified_file(inject_path_w, L"VG_POC_INJECT_SHA256");
+	verified_hook = vg_poc_verified_file(hook_dll_w, L"VG_POC_HOOK_SHA256");
+	if (verified_helper == INVALID_HANDLE_VALUE || verified_hook == INVALID_HANDLE_VALUE || !anti_cheat)
+		goto cleanup;
+	blog(LOG_INFO, "[VG_POC] verified private helper/hook, compatibility=1");
 	si.cb = sizeof(si);
 
 	swprintf(command_line_w, 4096, L"\"%s\" \"%s\" %lu %lu", inject_path_w, hook_dll_w, (unsigned long)anti_cheat,
@@ -904,7 +976,12 @@ static inline bool create_inject_process(struct game_capture *gc, const char *in
 		warn("Failed to create inject helper process: %lu", GetLastError());
 	}
 
+cleanup:
+	if (verified_helper != INVALID_HANDLE_VALUE) CloseHandle(verified_helper);
+	if (verified_hook != INVALID_HANDLE_VALUE) CloseHandle(verified_hook);
 	free(command_line_w);
+	bfree(abs_inject_path);
+	bfree(abs_hook_dll);
 	bfree(inject_path_w);
 	bfree(hook_dll_w);
 	return success;

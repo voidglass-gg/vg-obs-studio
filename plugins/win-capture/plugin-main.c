@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <obs-module.h>
+#include <util/windows/vg-poc-dll-security.h>
 #include <util/dstr.h>
 #include <util/windows/win-version.h>
 #include <util/platform.h>
@@ -48,6 +49,10 @@ static DWORD WINAPI init_hooks(LPVOID param)
 {
 	char *config_path = param;
 
+#ifdef VG_GAMEPUB_POC
+	/* This experiment has only 64-bit local fixtures; never spawn the old x86 helper. */
+	load_graphics_offsets(false, false, config_path);
+#else
 	if (use_hook_address_cache && cached_versions_match() && load_cached_graphics_offsets(IS32BIT, config_path)) {
 
 		load_cached_graphics_offsets(!IS32BIT, config_path);
@@ -57,6 +62,7 @@ static DWORD WINAPI init_hooks(LPVOID param)
 		load_graphics_offsets(!IS32BIT, use_hook_address_cache, config_path);
 	}
 
+#endif
 	bfree(config_path);
 	return 0;
 }
@@ -103,15 +109,16 @@ bool wgc_supported = false;
 
 bool obs_module_load(void)
 {
+	if (!vg_poc_bootstrap("win-capture", L"VG_POC_PLUGIN_SHA256", (const void *)&obs_module_load)) return false;
 	struct win_version_info ver;
+	struct win_version_info win1903 = {.major = 10, .minor = 0, .build = 18362, .revis = 0};
 	bool win8_or_above = false;
+#ifndef VG_GAMEPUB_POC
 	char *local_dir;
 	char *config_dir;
 
 	char update_url[128];
 	snprintf(update_url, sizeof(update_url), "%s/v%d", COMPAT_URL, COMPAT_FORMAT_VERSION);
-
-	struct win_version_info win1903 = {.major = 10, .minor = 0, .build = 18362, .revis = 0};
 
 	local_dir = obs_module_file(NULL);
 	config_dir = obs_module_config_path(NULL);
@@ -125,6 +132,12 @@ bool obs_module_load(void)
 	}
 	bfree(config_dir);
 	bfree(local_dir);
+#else
+	/* The host must anchor these paths to its own private executable, not CWD. */
+	if (!vg_poc_absolute_path(obs_get_module_binary_path(obs_current_module())) ||
+	    !vg_poc_absolute_path(obs_get_module_data_path(obs_current_module())))
+		return false;
+#endif
 
 	get_win_ver(&ver);
 

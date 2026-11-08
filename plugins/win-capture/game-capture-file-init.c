@@ -4,6 +4,7 @@
 #include <aclapi.h>
 #include <sddl.h>
 #include <obs-module.h>
+#include <util/windows/vg-poc-dll-security.h>
 #include <util/windows/win-version.h>
 #include <util/platform.h>
 #include <util/c99defs.h>
@@ -149,6 +150,12 @@ static bool programdata32_hook_exists = false;
 
 char *get_hook_path(bool b64)
 {
+#ifdef VG_GAMEPUB_POC
+	/* No ProgramData fallback, even if a compatible installed hook exists. */
+	if (!vg_poc_absolute_path(obs_get_module_data_path(obs_current_module())))
+		return NULL;
+	return obs_module_file(b64 ? "graphics-hook64.dll" : "graphics-hook32.dll");
+#else
 	wchar_t path[MAX_PATH];
 
 	get_programdata_path(path, L"obs-studio-hook\\");
@@ -161,6 +168,7 @@ char *get_hook_path(bool b64)
 	}
 
 	return obs_module_file(b64 ? "graphics-hook64.dll" : "graphics-hook32.dll");
+#endif
 }
 
 /* ------------------------------------------------------------------------- */
@@ -310,6 +318,10 @@ finish:
 
 void init_hook_files()
 {
+#ifdef VG_GAMEPUB_POC
+	blog(LOG_INFO, "[VG_GAMEPUB_POC] global hook copies, ACL changes and registry updates disabled");
+	return;
+#else
 	if (update_hook_file(true)) {
 		programdata64_hook_exists = true;
 		init_vulkan_registry(true);
@@ -318,4 +330,5 @@ void init_hook_files()
 		programdata32_hook_exists = true;
 		init_vulkan_registry(false);
 	}
+#endif
 }

@@ -26,6 +26,9 @@ find_package(jansson REQUIRED)
 add_library(win-capture MODULE)
 add_library(OBS::capture ALIAS win-capture)
 
+# Experimental branch only: never consult/update installed hook locations.
+target_compile_definitions(win-capture PRIVATE VG_GAMEPUB_POC)
+
 target_sources(
   win-capture
   PRIVATE
@@ -58,6 +61,8 @@ target_compile_definitions(
     "$<$<BOOL:${ENABLE_COMPAT_UPDATES}>:ENABLE_COMPAT_UPDATES>"
     OBS_VERSION="${OBS_VERSION_CANONICAL}"
 )
+
+target_link_libraries(win-capture PRIVATE bcrypt.lib)
 
 target_link_libraries(
   win-capture
