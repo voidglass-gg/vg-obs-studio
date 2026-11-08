@@ -5,6 +5,7 @@
 #include <d3d11_4.h>
 #include <wrl/client.h>
 #include "graphics-hook.h"
+#include "voidglass-performance-poc.hpp"
 using Microsoft::WRL::ComPtr;
 namespace {
 struct publication_backend {
@@ -38,6 +39,7 @@ publication_backend *make_backend(void *dev, void *ctx, UINT &flags, HRESULT &hr
 		delete backend;
 		return nullptr;
 	}
+	vg_perf_fence_created();
 	return backend;
 }
 } // namespace
@@ -204,6 +206,9 @@ extern "C" void vg_pub_submitted(void)
 	const auto start = vg_pub_qpc();
 	const HRESULT hr = slot->backend->signal(next);
 	const auto cost = vg_pub_qpc() - start;
+#ifndef VG_PUB_UNIT_TEST
+	vg_perf_signal(cost, hr);
+#endif
 	AcquireSRWLockExclusive(&mutex);
 	if (current == slot && state.generation == generation) {
 		slot->signaling = false;

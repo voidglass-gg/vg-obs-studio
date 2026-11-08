@@ -41,6 +41,10 @@ target_sources(
 )
 
 target_compile_definitions(graphics-hook PRIVATE COMPILE_D3D12_HOOK)
+option(VG_GAMEPUB_PERF "Enable fixture-only preallocated CPU timing instrumentation" OFF)
+if(VG_GAMEPUB_PERF)
+  target_compile_definitions(graphics-hook PRIVATE VG_GAMEPUB_PERF)
+endif()
 
 target_link_libraries(
   graphics-hook

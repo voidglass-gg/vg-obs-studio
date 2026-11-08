@@ -1,4 +1,5 @@
 #include <voidglass-publication-poc.h>
+#include "voidglass-performance-poc.hpp"
 #include <d3d11.h>
 #include <dxgi.h>
 
@@ -251,6 +252,7 @@ static inline void d3d11_copy_texture(ID3D11Resource *dst, ID3D11Resource *src)
 static inline void d3d11_shtex_capture(ID3D11Resource *backbuffer)
 {
 	if (data.texture) {
+		vg_perf_capture_scope timing;
 		d3d11_copy_texture(data.texture, backbuffer);
 		vg_pub_submitted();
 	}
