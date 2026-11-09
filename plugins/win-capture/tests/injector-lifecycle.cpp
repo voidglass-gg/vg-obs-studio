@@ -4,6 +4,9 @@
 #include <vector>
 #include <future>
 #include <thread>
+#include <algorithm>
+#include <cstring>
+#include <functional>
 using namespace vg_injector;
 static unsigned checks = 0;
 static void check(bool v, const char *why)
@@ -22,6 +25,7 @@ struct Fake : Ops {
 		uint64_t id;
 		Process *p = nullptr;
 		uint32_t due = 0;
+		std::chrono::steady_clock::time_point until{};
 		bool retiring = false, parked = false;
 	};
 	std::vector<std::unique_ptr<Process>> children;
@@ -29,6 +33,9 @@ struct Fake : Ops {
 	unsigned launches = 0, prepares = 0, reports = 0, closed = 0;
 	bool prepare_fail = false;
 	uint32_t kill_error = 0;
+	std::chrono::steady_clock::time_point clock{};
+	std::function<void()> on_poll;
+	std::chrono::steady_clock::time_point now() { return clock; }
 	Owner owner{*this};
 	Child launch()
 	{
@@ -55,6 +62,7 @@ struct Fake : Ops {
 		auto &r = *static_cast<Watch *>(w);
 		check(!r.retiring, "arm retired wait");
 		r.due = due;
+		r.until = due ? now() + std::chrono::milliseconds(due) : decltype(clock){};
 		r.parked = false;
 	}
 	void park(Handle w) override { static_cast<Watch *>(w)->parked = true; }
@@ -62,6 +70,11 @@ struct Fake : Ops {
 	{
 		auto &r = *static_cast<Process *>(p);
 		check(!r.closed, "poll closed handle");
+		if (on_poll) {
+			auto callback = std::move(on_poll);
+			on_poll = nullptr;
+			callback();
+		}
 		return {r.exited, r.exited, r.code, r.error};
 	}
 	uint32_t terminate(Handle p) override
@@ -114,9 +127,170 @@ struct Fake : Ops {
 		return owner.start(id, compat, [&] { return launch(); });
 	}
 };
-int main()
+static void p2_tests()
+{
+	using namespace std::chrono;
+	{
+		Fake f;
+		auto a = f.owner.acquire({20, 100});
+		check(f.start(a), "P2-A start");
+		f.clock += milliseconds(Owner::watchdog_ms); // old timeout queued, not delivered
+		auto old_watchdog = [&] { f.owner.wake(a, true); };
+		f.owner.release(a); // terminal STOP arms a fresh drain
+		auto deadline = f.waits[0]->until;
+		check(f.due(a) == Owner::drain_ms, "P2-A STOP armed drain");
+		for (unsigned i = 0; i < 4; ++i) {
+			f.clock += milliseconds(1000);
+			old_watchdog();
+			check(f.owner.status(a).state == State::cancelling, "P2-A stale watchdog blocked early");
+			check(f.waits[0]->until == deadline && f.due(a) == Owner::drain_ms - (i + 1) * 1000,
+			      "P2-A repeated callback moved drain deadline");
+			check(f.children[0]->kills == 1 && f.closed == 0 && !f.owner.can_start(a),
+			      "P2-A stale callback lost ownership or killed twice");
+		}
+		f.clock = deadline - microseconds(500);
+		old_watchdog();
+		check(f.owner.status(a).state == State::cancelling && f.due(a) == 1,
+		      "P2-A positive submillisecond remainder became infinite/expired");
+		check(f.waits[0]->until >= deadline && f.waits[0]->until < deadline + milliseconds(1),
+		      "P2-A remaining duration must round up");
+		f.exit(0);
+		old_watchdog();
+		f.reap();
+		check(f.closed == 1 && f.owner.pending() == 0, "P2-A cleanup");
+		std::puts("P2-A PASS: queued watchdog after STOP, fixed deadline, positive remainder");
+	}
+	for (unsigned delay : {1000u, 4999u, 5000u}) {
+		Fake f;
+		auto a = f.owner.acquire({21, 100});
+		f.start(a);
+		f.clock += milliseconds(Owner::watchdog_ms);
+		f.owner.release(a);
+		f.clock += milliseconds(delay);
+		f.exit(0, 23);
+		f.owner.wake(a, true); // exit wins even if this is the old timeout, or at deadline
+		auto s = f.owner.status(a);
+		check(s.state == State::exited && s.code_known && s.exit_code == 23,
+		      "P2-B real exit must precede timeout interpretation");
+		check(f.reports == 1 && f.children[0]->kills == 1, "P2-B unnecessary quarantine or kill");
+		f.owner.wake(a, true);
+		f.owner.wake(a, false);
+		f.reap();
+		f.owner.wake(a, true); // context id after reaping cannot touch freed watch/child
+		check(f.closed == 1 && f.owner.pending() == 0, "P2-B cleanup not unique");
+	}
+	std::puts("P2-B PASS: exit during drain and exactly at deadline, unique cleanup");
+	{
+		Fake f;
+		auto a = f.owner.acquire({22, 100});
+		f.start(a);
+		f.clock += milliseconds(Owner::watchdog_ms);
+		f.owner.release(a);
+		f.clock += milliseconds(1000);
+		f.owner.wake(a, true);
+		check(f.owner.status(a).state == State::cancelling, "P2-C blocked before true deadline");
+		f.clock += milliseconds(4000);
+		f.owner.wake(a, true);
+		check(f.owner.status(a).state == State::blocked && f.due(a) == 0,
+		      "P2-C actual expiry must preserve natural observation");
+		check(f.owner.pending() == 1 && f.closed == 0 && f.children[0]->kills == 1,
+		      "P2-C quarantine lost live handle");
+		auto b = f.owner.acquire({22, 100});
+		check(a == b && !f.start(b), "P2-C same identity reinjected");
+		for (unsigned i = 0; i < 4; ++i) {
+			f.clock += milliseconds(10000);
+			f.owner.wake(a, true);
+			f.owner.shutdown();
+			check(f.owner.status(a).state == State::blocked && f.due(a) == 0 && f.children[0]->kills == 1,
+			      "P2-C callback/STOP extended or restarted drain");
+		}
+		f.exit(0, 1223);
+		f.owner.wake(a, false);
+		check(f.owner.status(a).state == State::exited && f.owner.status(a).exit_code == 1223,
+		      "P2-C natural late exit not followed");
+		f.reap();
+		f.owner.release(b);
+		check(f.closed == 1 && f.owner.pending() == 0, "P2-C cleanup");
+	}
+	std::puts("P2-C PASS: real drain expiry, owned quarantine, no retry, late natural exit");
+	unsigned order[] = {0, 1, 2};
+	do {
+		Fake f;
+		auto a = f.owner.acquire({23, 100});
+		f.start(a);
+		f.clock += milliseconds(Owner::watchdog_ms);
+		std::promise<void> gates[3];
+		std::future<void> actions[3];
+		for (unsigned i = 0; i < 3; ++i) {
+			auto gate = gates[i].get_future();
+			actions[i] = std::async(std::launch::async, [&, i, gate = std::move(gate)]() mutable {
+				gate.wait();
+				if (i == 0)
+					f.owner.release(a);
+				else if (i == 1)
+					f.owner.shutdown();
+				else
+					f.owner.wake(a, true);
+			});
+		}
+		// Three live control threads, six explicit serializations; never depend on scheduler luck.
+		for (auto i : order) {
+			gates[i].set_value();
+			actions[i].get();
+		}
+		check(f.owner.status(a).state == State::cancelling && f.due(a) == Owner::drain_ms,
+		      "P2-D reordered STOP/shutdown/watchdog changed deadline");
+		check(f.children[0]->kills == 1 && !f.start(a), "P2-D duplicate kill/injection");
+		f.exit(0);
+		f.owner.wake(a, false);
+		f.owner.wake(a, true);
+		f.reap();
+		f.owner.wake(a, true);
+		check(f.closed == 1 && f.owner.pending() == 0, "P2-D reordered cleanup");
+	} while (std::next_permutation(std::begin(order), std::end(order)));
+	{
+		Fake f;
+		auto a = f.owner.acquire({24, 100});
+		f.start(a);
+		f.clock += milliseconds(Owner::watchdog_ms);
+		std::promise<void> polling, resume, stopping;
+		auto go = resume.get_future();
+		f.on_poll = [&] {
+			polling.set_value();
+			go.wait(); // test-only gate: callback holds owner lock while STOP arrives
+		};
+		auto callback = std::async(std::launch::async, [&] { f.owner.wake(a, true); });
+		polling.get_future().wait();
+		auto stop = std::async(std::launch::async, [&] {
+			stopping.set_value();
+			f.owner.release(a);
+			f.owner.shutdown();
+		});
+		stopping.get_future().wait();
+		resume.set_value();
+		callback.get();
+		stop.get();
+		f.clock += milliseconds(1);
+		f.owner.wake(a, true);
+		check(f.owner.status(a).state == State::cancelling && f.due(a) == Owner::drain_ms - 1 &&
+			      f.children[0]->kills == 1,
+		      "P2-D callback racing terminal destruction corrupted drain");
+		f.exit(0);
+		f.owner.wake(a, false);
+		f.reap();
+		check(f.closed == 1 && f.owner.pending() == 0, "P2-D contended cleanup");
+	}
+	std::puts("P2-D PASS: six ordered interleavings and callback holding lock against STOP/shutdown");
+}
+int main(int argc, char **argv)
 {
 	try {
+		if (argc == 2 && !std::strcmp(argv[1], "--p2-only")) {
+			p2_tests();
+			std::printf("injector P2: %u checks PASS (virtual clock/process/wait APIs; no injection)\n", checks);
+			return 0;
+		}
+		check(argc == 1, "unexpected test argument");
 		{
 			Fake f;
 			auto a = f.owner.acquire({10, 100});
@@ -355,6 +529,8 @@ int main()
 			check(drained && f.owner.pending() == 0 && f.closed == 1,
 			      "control-thread drain without graphics tick");
 		}
+		std::printf("existing injector lifecycle: %u checks PASS\n", checks);
+		p2_tests();
 		std::printf(
 			"injector lifecycle: %u checks PASS (real owner, simulated process/wait APIs; no injection)\n",
 			checks);
