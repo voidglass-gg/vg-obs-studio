@@ -339,6 +339,22 @@ int main()
 			f.reap();
 			f.owner.release(a);
 		}
+		{
+			Fake f;
+			auto a = f.owner.acquire({10, 100});
+			f.start(a);
+			f.owner.release(a);
+			check(!f.owner.drain(1) && f.closed == 0, "shutdown deadline must not discard a live child");
+			std::thread done([&] {
+				f.exit(0);
+				f.owner.wake(a, false);
+				f.reap();
+			});
+			bool drained = f.owner.drain(1000);
+			done.join();
+			check(drained && f.owner.pending() == 0 && f.closed == 1,
+			      "control-thread drain without graphics tick");
+		}
 		std::printf(
 			"injector lifecycle: %u checks PASS (real owner, simulated process/wait APIs; no injection)\n",
 			checks);

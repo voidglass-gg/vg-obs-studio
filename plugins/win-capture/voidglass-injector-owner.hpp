@@ -5,6 +5,8 @@
 #include <mutex>
 #include <utility>
 #include <tuple>
+#include <condition_variable>
+#include <chrono>
 
 namespace vg_injector {
 using Handle = void *;
@@ -51,6 +53,7 @@ class Owner {
 	};
 	Ops &ops;
 	std::mutex mutex;
+	std::condition_variable drained;
 	uint64_t serial = 0;
 	std::map<uint64_t, std::unique_ptr<Entry>> entries;
 	std::map<uint32_t, Status> issued; // latest process identity per PID; metadata only
@@ -255,6 +258,7 @@ public:
 		e.child = nullptr;
 		e.watch = nullptr;
 		e.retiring = false;
+		drained.notify_all();
 		if (!e.clients)
 			entries.erase(i);
 	}
@@ -263,6 +267,17 @@ public:
 		std::lock_guard<std::mutex> lock(mutex);
 		for (auto &row : entries)
 			cancel(*row.second);
+	}
+	// Control-thread teardown only, after libobs stop_video(). Never used by source STOP/tick.
+	bool drain(uint32_t milliseconds)
+	{
+		std::unique_lock<std::mutex> lock(mutex);
+		return drained.wait_for(lock, std::chrono::milliseconds(milliseconds), [&] {
+			for (auto &row : entries)
+				if (row.second->child || row.second->launching || row.second->retiring)
+					return false;
+			return true;
+		});
 	}
 	size_t pending()
 	{

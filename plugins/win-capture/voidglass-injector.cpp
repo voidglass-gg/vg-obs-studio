@@ -143,8 +143,9 @@ vg_injector_status vg_injector_get_status(uint64_t lease)
 	return {s.id,        s.key.creation, s.key.pid,       s.helper_pid, (uint32_t)s.state,
 		s.exit_code, s.error,        s.compatibility, s.code_known, s.cancelled};
 }
-void vg_injector_shutdown(void)
+bool vg_injector_shutdown(void)
 {
 	owner().shutdown();
+	return owner().drain(Owner::drain_ms);
 }
 }

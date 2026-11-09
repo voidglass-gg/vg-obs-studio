@@ -163,7 +163,8 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
-	vg_injector_shutdown();
+	if (!vg_injector_shutdown())
+		blog(LOG_WARNING, "[win-capture] helper drain deadline reached; remaining helpers stay observed and injection stays blocked");
 	wait_for_hook_initialization();
 	update_info_destroy(update_info);
 	compat_json_free();

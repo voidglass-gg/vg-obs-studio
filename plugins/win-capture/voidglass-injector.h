@@ -20,7 +20,8 @@ bool vg_injector_start(uint64_t lease, bool compatibility, vg_injector_launch la
 bool vg_injector_claim_direct(uint64_t lease);
 void vg_injector_release(uint64_t lease);
 struct vg_injector_status vg_injector_get_status(uint64_t lease);
-void vg_injector_shutdown(void);
+// Module teardown only: libobs has stopped the video thread before calling unload.
+bool vg_injector_shutdown(void);
 #ifdef __cplusplus
 }
 #endif
