@@ -1,3 +1,4 @@
+#include "voidglass-injector.h"
 #include <windows.h>
 #include <obs-module.h>
 #include <util/dstr.h>
@@ -162,6 +163,7 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+	vg_injector_shutdown();
 	wait_for_hook_initialization();
 	update_info_destroy(update_info);
 	compat_json_free();
