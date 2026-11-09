@@ -49,6 +49,7 @@ struct WindowsOps final : Ops {
 		return w;
 	}
 	void bind(Handle w, Handle child) override { static_cast<Watch *>(w)->child = child; }
+	std::chrono::steady_clock::time_point now() override { return std::chrono::steady_clock::now(); }
 	void arm(Handle handle, uint32_t milliseconds) override
 	{
 		auto *w = static_cast<Watch *>(handle);

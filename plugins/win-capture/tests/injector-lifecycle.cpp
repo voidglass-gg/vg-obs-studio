@@ -35,7 +35,7 @@ struct Fake : Ops {
 	uint32_t kill_error = 0;
 	std::chrono::steady_clock::time_point clock{};
 	std::function<void()> on_poll;
-	std::chrono::steady_clock::time_point now() { return clock; }
+	std::chrono::steady_clock::time_point now() override { return clock; }
 	Owner owner{*this};
 	Child launch()
 	{
@@ -135,13 +135,16 @@ static void p2_tests()
 		auto a = f.owner.acquire({20, 100});
 		check(f.start(a), "P2-A start");
 		f.clock += milliseconds(Owner::watchdog_ms); // old timeout queued, not delivered
-		auto old_watchdog = [&] { f.owner.wake(a, true); };
+		auto old_watchdog = [&] {
+			f.owner.wake(a, true);
+		};
 		f.owner.release(a); // terminal STOP arms a fresh drain
 		auto deadline = f.waits[0]->until;
 		check(f.due(a) == Owner::drain_ms, "P2-A STOP armed drain");
 		for (unsigned i = 0; i < 4; ++i) {
 			f.clock += milliseconds(1000);
 			old_watchdog();
+			f.owner.wake(a, false); // callback reason never overrides a confirmed live drain
 			check(f.owner.status(a).state == State::cancelling, "P2-A stale watchdog blocked early");
 			check(f.waits[0]->until == deadline && f.due(a) == Owner::drain_ms - (i + 1) * 1000,
 			      "P2-A repeated callback moved drain deadline");
@@ -287,7 +290,8 @@ int main(int argc, char **argv)
 	try {
 		if (argc == 2 && !std::strcmp(argv[1], "--p2-only")) {
 			p2_tests();
-			std::printf("injector P2: %u checks PASS (virtual clock/process/wait APIs; no injection)\n", checks);
+			std::printf("injector P2: %u checks PASS (virtual clock/process/wait APIs; no injection)\n",
+				    checks);
 			return 0;
 		}
 		check(argc == 1, "unexpected test argument");
@@ -344,8 +348,10 @@ int main(int argc, char **argv)
 			auto a = f.owner.acquire({10, 100});
 			f.start(a);
 			check(f.due(a) == 15000, "watchdog armed independently of tick");
+			f.clock += std::chrono::milliseconds(Owner::watchdog_ms);
 			f.owner.wake(a, true);
 			check(f.children[0]->kills == 1 && f.due(a) == 5000, "watchdog cancellation");
+			f.clock += std::chrono::milliseconds(Owner::drain_ms);
 			f.owner.wake(a, true);
 			check(f.owner.status(a).state == State::blocked && f.due(a) == 0, "drain timeout quarantined");
 			check(f.closed == 0 && !f.start(a) && f.children[0]->kills == 1,
@@ -362,6 +368,7 @@ int main(int argc, char **argv)
 			f.start(a, false);
 			f.owner.release(a);
 			check(f.children[0]->kills == 0, "direct killed on STOP");
+			f.clock += std::chrono::milliseconds(Owner::watchdog_ms);
 			f.owner.wake(a, true);
 			check(f.children[0]->kills == 0 && f.due(a) == 0 && f.reports == 1,
 			      "direct stall not reported");
@@ -455,6 +462,7 @@ int main(int argc, char **argv)
 			f.start(a);
 			f.kill_error = 5;
 			f.owner.release(a);
+			f.clock += std::chrono::milliseconds(Owner::drain_ms);
 			f.owner.wake(a, true);
 			check(f.owner.status(a).state == State::blocked && f.closed == 0,
 			      "failed kill falsely completed");

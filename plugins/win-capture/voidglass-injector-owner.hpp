@@ -36,20 +36,22 @@ struct Ops {
 	virtual ~Ops() = default;
 	virtual Handle prepare(uint64_t) = 0; // reserve wait AND deferred cleanup before launch
 	virtual void bind(Handle, Handle) = 0;
-	virtual void arm(Handle, uint32_t) = 0; // 0=infinite; never invokes callback inline
+	virtual void arm(Handle, uint32_t) = 0;                  // 0=infinite; never invokes callback inline
+	virtual std::chrono::steady_clock::time_point now() = 0; // monotonic, nonblocking
 	virtual Poll poll(Handle) = 0;
 	virtual uint32_t terminate(Handle) = 0;
 	virtual void park(Handle) = 0;
 	virtual void retire(Handle) = 0; // disarm, drain callbacks OFF caller thread, close owned child
 	virtual void report(const Status &) = 0;
 };
-// Same code in production and deterministic tests. No source pointers, clock polling or threads.
+// Same code in production and deterministic tests. No source pointers, polling loop or threads.
 class Owner {
 	struct Entry {
 		Status s;
 		unsigned clients = 0;
 		Handle child = nullptr, watch = nullptr;
 		bool issued = false, launching = false, retiring = false, kill_sent = false;
+		std::chrono::steady_clock::time_point drain_deadline{};
 	};
 	Ops &ops;
 	std::mutex mutex;
@@ -99,6 +101,7 @@ class Owner {
 		e.kill_sent = true;
 		e.s.state = State::cancelling;
 		e.s.error = ops.terminate(e.child); // only the exact owned helper HANDLE
+		e.drain_deadline = ops.now() + std::chrono::milliseconds(drain_ms);
 		p = ops.poll(e.child);
 		if (p.exited) {
 			finish(e, p);
@@ -232,6 +235,17 @@ public:
 		if (p.exited) {
 			finish(e, p);
 			return;
+		}
+		if (!p.error && e.kill_sent) {
+			// Rearming a Win32 wait does not remove an already queued watchdog callback.
+			// Keep the original drain deadline; repeated callbacks must not extend it.
+			auto remaining = e.drain_deadline - ops.now();
+			if (remaining > std::chrono::steady_clock::duration::zero()) {
+				auto ms = std::chrono::ceil<std::chrono::milliseconds>(remaining).count();
+				ops.arm(e.watch,
+					static_cast<uint32_t>(ms)); // positive remainder must not become infinite
+				return;
+			}
 		}
 		if (!timeout || p.error) {
 			e.s.state = State::blocked;
