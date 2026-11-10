@@ -1977,7 +1977,15 @@ void obs_encoder_set_last_error(obs_encoder_t *encoder, const char *message)
 
 uint64_t obs_encoder_get_pause_offset(const obs_encoder_t *encoder)
 {
-	return encoder ? encoder->pause.ts_offset : 0;
+	if (!encoder)
+		return 0;
+
+	/* Logical constness: synchronize with both pause transitions and reset. */
+	pthread_mutex_t *mutex = (pthread_mutex_t *)&encoder->pause.mutex;
+	pthread_mutex_lock(mutex);
+	uint64_t offset = encoder->pause.ts_offset;
+	pthread_mutex_unlock(mutex);
+	return offset;
 }
 
 bool obs_encoder_has_roi(const obs_encoder_t *encoder)
