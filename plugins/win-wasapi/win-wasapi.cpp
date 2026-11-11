@@ -1445,7 +1445,15 @@ static void *CreateWASAPISource(obs_data_t *settings, obs_source_t *source, Sour
 
 static void *CreateWASAPIInput(obs_data_t *settings, obs_source_t *source)
 {
-	return CreateWASAPISource(settings, source, SourceType::Input);
+	auto *input = static_cast<WASAPISource *>(CreateWASAPISource(settings, source, SourceType::Input));
+	if (input) {
+		// Audio-only owners have no video tick to dispatch info.activate.
+		// Use the existing worker and the same destruction fence as ProcessOutput.
+		proc_handler_add(obs_source_get_proc_handler(source),
+				 "void voidglass_enable_headless_reconnect(out bool enabled)",
+				 wasapi_enable_headless_reconnect, input);
+	}
+	return input;
 }
 
 static void *CreateWASAPIDeviceOutput(obs_data_t *settings, obs_source_t *source)
