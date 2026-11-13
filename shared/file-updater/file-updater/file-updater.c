@@ -252,7 +252,8 @@ static bool init_update(struct update_info *info)
 	info->cache_package = get_package(info->cache, "package.json");
 
 	obs_data_t *metadata = get_package(info->cache, "meta.json");
-	if (metadata) {
+	if (metadata && info->cache_package && obs_data_has_user_value(metadata, "version") &&
+	    obs_data_get_int(metadata, "version") == obs_data_get_int(info->cache_package, "version")) {
 		const char *etag = obs_data_get_string(metadata, "etag");
 		if (etag) {
 			struct dstr if_none_match = {0};
@@ -265,9 +266,8 @@ static bool init_update(struct update_info *info)
 
 			dstr_free(&if_none_match);
 		}
-
-		obs_data_release(metadata);
 	}
+	obs_data_release(metadata);
 
 	dstr_copy(&user_agent, "User-Agent: ");
 	dstr_cat(&user_agent, info->user_agent);
@@ -278,19 +278,28 @@ static bool init_update(struct update_info *info)
 	return true;
 }
 
-static void copy_local_to_cache(struct update_info *info, const char *file)
+static bool copy_local_to_cache(struct update_info *info, const char *file)
 {
 	char *local_file_path = get_path(info->local, file);
 	char *cache_file_path = get_path(info->cache, file);
 	char *temp_file_path = get_path(info->temp, file);
+	bool success = false;
 
-	os_copyfile(local_file_path, temp_file_path);
-	os_unlink(cache_file_path);
-	os_rename(temp_file_path, cache_file_path);
+	/* A previous interrupted copy may have left a staging file. */
+	if (os_file_exists(temp_file_path) && os_unlink(temp_file_path) != 0) {
+		warn("Could not remove staging file '%s'", temp_file_path);
+	} else if (os_copyfile(local_file_path, temp_file_path) != 0) {
+		warn("Could not stage local file '%s'", local_file_path);
+	} else if (os_rename(temp_file_path, cache_file_path) != 0) {
+		warn("Could not commit local file '%s'", cache_file_path);
+	} else {
+		success = true;
+	}
 
 	bfree(local_file_path);
 	bfree(cache_file_path);
 	bfree(temp_file_path);
+	return success;
 }
 
 static void enum_files(obs_data_t *package, bool (*enum_func)(void *param, obs_data_t *file), void *param)
@@ -344,8 +353,10 @@ static bool update_files_to_local(void *param, obs_data_t *local_file)
 					.version = (int)obs_data_get_int(local_file, "version")};
 
 	enum_files(info->cache_package, newer_than_cache, &data);
-	if (data.newer || !data.found)
-		copy_local_to_cache(info, data.name);
+	if ((data.newer || !data.found) && !copy_local_to_cache(info, data.name)) {
+		info->download_failed = true;
+		return false;
+	}
 
 	return true;
 }
@@ -361,7 +372,8 @@ static int update_local_version(struct update_info *info)
 	/* if local cached version is out of date, copy new version */
 	if (cache_version < local_version) {
 		enum_files(info->local_package, update_files_to_local, info);
-		copy_local_to_cache(info, "package.json");
+		if (info->download_failed || !copy_local_to_cache(info, "package.json"))
+			return -1;
 
 		obs_data_release(info->cache_package);
 		obs_data_addref(info->local_package);
@@ -382,25 +394,44 @@ static inline bool do_relative_http_request(struct update_info *info, const char
 	return success && response_code == 200;
 }
 
-static inline void write_file_data(struct update_info *info, const char *base_path, const char *file)
+static bool write_cache_data(struct update_info *info, const char *base_path, const char *file,
+			     const char *data, size_t len)
 {
 	char *full_path = get_path(base_path, file);
-	os_quick_write_utf8_file(full_path, (char *)info->file_data.array, info->file_data.num - 1, false);
+	FILE *output = os_fopen(full_path, "wb");
+	bool success = false;
+
+	if (output) {
+		success = !len || fwrite(data, len, 1, output) == 1;
+		if (fflush(output) != 0)
+			success = false;
+		if (fclose(output) != 0)
+			success = false;
+	}
+	if (!success)
+		warn("Could not write staging file '%s'", full_path);
 	bfree(full_path);
+	return success;
 }
 
-static inline void replace_file(const char *src_base_path, const char *dst_base_path, const char *file)
+static inline bool write_file_data(struct update_info *info, const char *base_path, const char *file)
+{
+	return write_cache_data(info, base_path, file, (char *)info->file_data.array, info->file_data.num - 1);
+}
+
+static inline bool replace_file(struct update_info *info, const char *src_base_path, const char *dst_base_path,
+				const char *file)
 {
 	char *src_path = get_path(src_base_path, file);
 	char *dst_path = get_path(dst_base_path, file);
-
-	if (src_path && dst_path) {
-		os_unlink(dst_path);
-		os_rename(src_path, dst_path);
-	}
+	/* os_rename replaces the destination; do not unlink the previous cache. */
+	bool success = src_path && dst_path && os_rename(src_path, dst_path) == 0;
+	if (!success)
+		warn("Could not commit cache file '%s'", dst_path);
 
 	bfree(dst_path);
 	bfree(src_path);
+	return success;
 }
 
 static bool update_remote_files(void *param, obs_data_t *remote_file)
@@ -445,30 +476,30 @@ static bool update_remote_files(void *param, obs_data_t *remote_file)
 
 	if (update_cancelled(info))
 		return false;
-	write_file_data(info, info->temp, data.name);
-	replace_file(info->temp, info->cache, data.name);
+	if (!write_file_data(info, info->temp, data.name) ||
+	    !replace_file(info, info->temp, info->cache, data.name)) {
+		info->download_failed = true;
+		return false;
+	}
 
 	info("Successfully updated file '%s' (version %d)", data.name, data.version);
 	return true;
 }
 
-static void update_save_metadata(struct update_info *info)
+static bool update_save_metadata(struct update_info *info, int cache_version)
 {
-	struct dstr path = {0};
-
 	if (!info->etag_remote)
-		return;
+		return true;
 
-	dstr_copy(&path, info->cache);
-	dstr_cat(&path, "meta.json");
-
-	obs_data_t *data;
-	data = obs_data_create();
+	obs_data_t *data = obs_data_create();
 	obs_data_set_string(data, "etag", info->etag_remote);
-	obs_data_save_json(data, path.array);
+	/* Ignore legacy/unmatched ETags on load, including poisoned E3C caches. */
+	obs_data_set_int(data, "version", cache_version);
+	const char *json = obs_data_get_json(data);
+	bool success = json && write_cache_data(info, info->temp, "meta.json", json, strlen(json)) &&
+		       replace_file(info, info->temp, info->cache, "meta.json");
 	obs_data_release(data);
-
-	dstr_free(&path);
+	return success;
 }
 
 static void update_remote_version(struct update_info *info, int cur_version)
@@ -495,12 +526,13 @@ static void update_remote_version(struct update_info *info, int cur_version)
 
 	remote_version = (int)obs_data_get_int(info->remote_package, "version");
 	if (remote_version <= cur_version) {
-		if (!update_cancelled(info))
-			update_save_metadata(info);
+		if (!update_cancelled(info) && !update_save_metadata(info, cur_version))
+			warn("Could not refresh cache metadata");
 		return;
 	}
 
-	write_file_data(info, info->temp, "package.json");
+	if (!write_file_data(info, info->temp, "package.json"))
+		return;
 
 	info->remote_url = obs_data_get_string(info->remote_package, "url");
 	if (!info->remote_url) {
@@ -515,8 +547,10 @@ static void update_remote_version(struct update_info *info, int cur_version)
 	 * is retried on the next run rather than skipped as up to date. */
 	if (update_cancelled(info) || info->download_failed)
 		return;
-	update_save_metadata(info);
-	replace_file(info->temp, info->cache, "package.json");
+	if (!replace_file(info, info->temp, info->cache, "package.json"))
+		return;
+	if (!update_save_metadata(info, remote_version))
+		return;
 
 	info("Successfully updated package (version %d)", remote_version);
 	return;
@@ -531,7 +565,7 @@ static void *update_thread(void *data)
 		return NULL;
 
 	cur_version = update_local_version(info);
-	if (!update_cancelled(info))
+	if (cur_version >= 0 && !update_cancelled(info))
 		update_remote_version(info, cur_version);
 	os_rmdir(info->temp);
 
