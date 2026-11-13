@@ -35,6 +35,8 @@ struct update_info {
 
 	pthread_t thread;
 	bool thread_created;
+	volatile bool cancel;
+	bool download_failed;
 	char *log_prefix;
 };
 
@@ -43,6 +45,8 @@ void update_info_destroy(struct update_info *info)
 	if (!info)
 		return;
 
+	/* The worker owns all curl operations until it has exited. */
+	os_atomic_set_bool(&info->cancel, true);
 	if (info->thread_created)
 		pthread_join(info->thread, NULL);
 
@@ -53,6 +57,8 @@ void update_info_destroy(struct update_info *info)
 	bfree(info->cache);
 	bfree(info->local);
 	bfree(info->url);
+	bfree(info->etag_local);
+	bfree(info->etag_remote);
 
 	if (info->header)
 		curl_slist_free_all(info->header);
@@ -67,8 +73,61 @@ void update_info_destroy(struct update_info *info)
 	bfree(info);
 }
 
+static bool update_cancelled(struct update_info *info)
+{
+	return os_atomic_load_bool(&info->cancel);
+}
+
+static int http_progress(void *param, curl_off_t total, curl_off_t now, curl_off_t upload_total, curl_off_t uploaded)
+{
+	UNUSED_PARAMETER(total);
+	UNUSED_PARAMETER(now);
+	UNUSED_PARAMETER(upload_total);
+	UNUSED_PARAMETER(uploaded);
+	return update_cancelled(param) ? 1 : 0;
+}
+
+/* Poll cancellation even when an idle transfer has no progress callbacks.
+ * No other thread may remove/clean up either handle. Bounded DNS with
+ * CURLOPT_NOSIGNAL requires an asynchronous resolver in libcurl. */
+static CURLcode perform_request(struct update_info *info)
+{
+	CURLM *multi = curl_multi_init();
+	CURLcode result = CURLE_FAILED_INIT;
+	int running = 0;
+	if (!multi)
+		return result;
+	if (curl_multi_add_handle(multi, info->curl) != CURLM_OK) {
+		curl_multi_cleanup(multi);
+		return result;
+	}
+
+	while (!update_cancelled(info)) {
+		if (curl_multi_perform(multi, &running) != CURLM_OK)
+			break;
+		if (!running) {
+			int remaining;
+			CURLMsg *message;
+			while ((message = curl_multi_info_read(multi, &remaining))) {
+				if (message->msg == CURLMSG_DONE && message->easy_handle == info->curl)
+					result = message->data.result;
+			}
+			break;
+		}
+		if (curl_multi_poll(multi, NULL, 0, 50, NULL) != CURLM_OK)
+			break;
+	}
+	if (update_cancelled(info))
+		result = CURLE_ABORTED_BY_CALLBACK;
+	curl_multi_remove_handle(multi, info->curl);
+	curl_multi_cleanup(multi);
+	return result;
+}
+
 static size_t http_write(char *ptr, size_t size, size_t nmemb, void *info_param)
 {
+	if (update_cancelled(info_param))
+		return 0;
 	size_t total = size * nmemb;
 	if (total) {
 		struct update_info *info = info_param;
@@ -80,6 +139,8 @@ static size_t http_write(char *ptr, size_t size, size_t nmemb, void *info_param)
 
 static size_t http_header(char *buffer, size_t size, size_t nitems, void *info_param)
 {
+	if (update_cancelled(info_param))
+		return 0;
 	if (!strncmp(buffer, "ETag: ", 6)) {
 		char *etag = buffer + 6;
 		if (*etag) {
@@ -96,6 +157,7 @@ static size_t http_header(char *buffer, size_t size, size_t nitems, void *info_p
 			if (p)
 				*p = 0;
 
+			bfree(info->etag_remote);
 			info->etag_remote = etag_clean;
 		}
 	}
@@ -107,6 +169,8 @@ static bool do_http_request(struct update_info *info, const char *url, long *res
 	CURLcode code;
 	uint8_t null_terminator = 0;
 
+	if (update_cancelled(info))
+		return false;
 	da_resize(info->file_data, 0);
 	curl_easy_setopt(info->curl, CURLOPT_URL, url);
 	curl_easy_setopt(info->curl, CURLOPT_HTTPHEADER, info->header);
@@ -115,6 +179,11 @@ static bool do_http_request(struct update_info *info, const char *url, long *res
 	curl_easy_setopt(info->curl, CURLOPT_WRITEDATA, info);
 	curl_easy_setopt(info->curl, CURLOPT_FAILONERROR, 1L);
 	curl_easy_setopt(info->curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(info->curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
+	curl_easy_setopt(info->curl, CURLOPT_TIMEOUT_MS, 30000L);
+	curl_easy_setopt(info->curl, CURLOPT_NOPROGRESS, 0L);
+	curl_easy_setopt(info->curl, CURLOPT_XFERINFOFUNCTION, http_progress);
+	curl_easy_setopt(info->curl, CURLOPT_XFERINFODATA, info);
 	curl_easy_setopt(info->curl, CURLOPT_ACCEPT_ENCODING, "");
 	curl_obs_set_revoke_setting(info->curl);
 
@@ -124,9 +193,11 @@ static bool do_http_request(struct update_info *info, const char *url, long *res
 		curl_easy_setopt(info->curl, CURLOPT_HEADERDATA, info);
 	}
 
-	code = curl_easy_perform(info->curl);
+	code = perform_request(info);
+	if (update_cancelled(info))
+		return false;
 	if (code != CURLE_OK) {
-		warn("Remote update of URL \"%s\" failed: %s", url, info->error);
+		warn("Remote update of URL \"%s\" failed: %s", url, info->error[0] ? info->error : curl_easy_strerror(code));
 		return false;
 	}
 
@@ -333,6 +404,9 @@ static bool update_remote_files(void *param, obs_data_t *remote_file)
 {
 	struct update_info *info = param;
 
+	if (update_cancelled(info))
+		return false;
+
 	struct file_update_data data = {.name = obs_data_get_string(remote_file, "name"),
 					.version = (int)obs_data_get_int(remote_file, "version")};
 
@@ -340,9 +414,13 @@ static bool update_remote_files(void *param, obs_data_t *remote_file)
 	if (!data.newer && data.found)
 		return true;
 
-	if (!do_relative_http_request(info, info->remote_url, data.name))
-		return true;
+	if (!do_relative_http_request(info, info->remote_url, data.name)) {
+		info->download_failed = true;
+		return !update_cancelled(info);
+	}
 
+	if (update_cancelled(info))
+		return false;
 	if (info->callback) {
 		struct file_download_data download_data;
 		bool confirm;
@@ -356,11 +434,14 @@ static bool update_remote_files(void *param, obs_data_t *remote_file)
 		info->file_data.da = download_data.buffer.da;
 
 		if (!confirm) {
+			info->download_failed = true;
 			info("Update file '%s' (version %d) rejected", data.name, data.version);
 			return true;
 		}
 	}
 
+	if (update_cancelled(info))
+		return false;
 	write_file_data(info, info->temp, data.name);
 	replace_file(info->temp, info->cache, data.name);
 
@@ -403,8 +484,6 @@ static void update_remote_version(struct update_info *info, int cur_version)
 		return;
 	}
 
-	update_save_metadata(info);
-
 	info->remote_package = obs_data_create_from_json((char *)info->file_data.array);
 	if (!info->remote_package) {
 		warn("Failed to initialize remote package json");
@@ -412,8 +491,11 @@ static void update_remote_version(struct update_info *info, int cur_version)
 	}
 
 	remote_version = (int)obs_data_get_int(info->remote_package, "version");
-	if (remote_version <= cur_version)
+	if (remote_version <= cur_version) {
+		if (!update_cancelled(info))
+			update_save_metadata(info);
 		return;
+	}
 
 	write_file_data(info, info->temp, "package.json");
 
@@ -426,6 +508,11 @@ static void update_remote_version(struct update_info *info, int cur_version)
 	/* download new files */
 	enum_files(info->remote_package, update_remote_files, info);
 
+	/* Preserve the previous manifest/ETag so a failed or cancelled download
+	 * is retried on the next run rather than skipped as up to date. */
+	if (update_cancelled(info) || info->download_failed)
+		return;
+	update_save_metadata(info);
 	replace_file(info->temp, info->cache, "package.json");
 
 	info("Successfully updated package (version %d)", remote_version);
@@ -441,13 +528,9 @@ static void *update_thread(void *data)
 		return NULL;
 
 	cur_version = update_local_version(info);
-	update_remote_version(info, cur_version);
+	if (!update_cancelled(info))
+		update_remote_version(info, cur_version);
 	os_rmdir(info->temp);
-
-	if (info->etag_local)
-		bfree(info->etag_local);
-	if (info->etag_remote)
-		bfree(info->etag_remote);
 
 	return NULL;
 }
@@ -508,7 +591,7 @@ static void *single_file_thread(void *data)
 
 	if (!do_http_request(info, info->url, &response_code))
 		return NULL;
-	if (!info->file_data.array || !info->file_data.array[0])
+	if (update_cancelled(info) || !info->file_data.array || !info->file_data.array[0])
 		return NULL;
 
 	download_data.name = info->url;

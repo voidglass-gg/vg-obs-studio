@@ -19,4 +19,7 @@ update_info_t *update_info_create(const char *log_prefix, const char *user_agent
 				  confirm_file_callback_t confirm_callback, void *param);
 update_info_t *update_info_create_single(const char *log_prefix, const char *user_agent, const char *file_url,
 					 confirm_file_callback_t confirm_callback, void *param);
+/* Cancels pending transfers and joins the worker before freeing its state.
+ * Keep callback parameters alive until this returns; do not call from the
+ * updater callback or concurrently with another destroy of the same object. */
 void update_info_destroy(update_info_t *info);
