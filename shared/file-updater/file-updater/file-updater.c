@@ -141,6 +141,9 @@ static size_t http_header(char *buffer, size_t size, size_t nitems, void *info_p
 {
 	if (update_cancelled(info_param))
 		return 0;
+	/* File responses must not replace the package ETag saved after commit. */
+	if (((struct update_info *)info_param)->remote_url)
+		return nitems * size;
 	if (!strncmp(buffer, "ETag: ", 6)) {
 		char *etag = buffer + 6;
 		if (*etag) {
