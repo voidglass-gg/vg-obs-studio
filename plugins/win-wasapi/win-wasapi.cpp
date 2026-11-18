@@ -23,6 +23,11 @@
 #include <RTWorkQ.h>
 #include <wrl/implements.h>
 
+#ifdef VOIDGLASS_AUDIO_TRACE
+#include "../voidglass-audio-trace/audio-trace.h"
+#include <memory>
+#endif
+
 using namespace std;
 
 #define OPT_DEVICE_ID "device_id"
@@ -233,6 +238,12 @@ class WASAPISource {
 
 	vector<BYTE> silence;
 
+#ifdef VOIDGLASS_AUDIO_TRACE
+	std::unique_ptr<vg_audio_trace, decltype(&vg_audio_trace_close)> audioTrace{nullptr, vg_audio_trace_close};
+	std::string traceExecutable;
+	bool traceFixture = false;
+#endif
+
 	static DWORD WINAPI ReconnectThread(LPVOID param);
 	static DWORD WINAPI CaptureThread(LPVOID param);
 
@@ -420,6 +431,17 @@ WASAPISource::WASAPISource(obs_data_t *settings, obs_source_t *source_, SourceTy
 									std::placeholders::_3));
 	}
 
+#ifdef VOIDGLASS_AUDIO_TRACE
+	const char *label = obs_source_get_name(source);
+	if (sourceType == SourceType::ProcessOutput && label && window_class == "VoidGlassMediaFixture" &&
+	    title == "media-target" &&
+	    ((strcmp(label, "game-audio") == 0 && executable == "stress-game.exe") ||
+	     (strcmp(label, "independent-audio") == 0 && executable == "stress-independent.exe") ||
+	     (strcmp(label, "camera-audio") == 0 && executable == "stress-camera.exe"))) {
+		traceExecutable = executable;
+		audioTrace.reset(vg_audio_trace_open(VG_WASAPI, label));
+	}
+#endif
 	Start();
 }
 
@@ -474,6 +496,10 @@ WASAPISource::~WASAPISource()
 		obs_source_audio_output_capture_device_changed(source, NULL);
 
 	Stop();
+#ifdef VOIDGLASS_AUDIO_TRACE
+	// Stop joins the capture thread or waits for the RTWQ capture callback to idle.
+	audioTrace.reset();
+#endif
 }
 
 WASAPISource::UpdateParams WASAPISource::BuildUpdateParams(obs_data_t *settings)
@@ -838,6 +864,14 @@ void WASAPISource::Initialize()
 			throw "Failed to get process id of window";
 
 		process_id = dwProcessId;
+#ifdef VOIDGLASS_AUDIO_TRACE
+		if (audioTrace) {
+			struct dstr image = {0};
+			ms_get_window_exe(&image, window);
+			traceFixture = image.array && _stricmp(image.array, traceExecutable.c_str()) == 0;
+			dstr_free(&image);
+		}
+#endif
 	} else {
 		device = InitDevice(enumerator, isDefaultDevice, sourceType, device_id);
 
@@ -1004,6 +1038,13 @@ bool WASAPISource::ProcessCaptureData()
 			return false;
 		}
 
+#ifdef VOIDGLASS_AUDIO_TRACE
+		if (audioTrace && traceFixture && res == S_OK && frames) {
+			const uint32_t rate = format == AUDIO_FORMAT_FLOAT && speakers == SPEAKERS_STEREO ? sampleRate : 0;
+			const vg_audio_chunk chunk{ts, pos, process_id, frames, rate, flags};
+			vg_audio_trace_push(audioTrace.get(), chunk, buffer, nullptr);
+		}
+#endif
 		if (!sawBadTimestamp && flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) {
 			blog(LOG_WARNING, "[WASAPISource::ProcessCaptureData]"
 					  " Timestamp error!");

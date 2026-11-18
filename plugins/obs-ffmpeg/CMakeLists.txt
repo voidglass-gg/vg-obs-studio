@@ -74,6 +74,10 @@ target_link_libraries(
 )
 
 if(OS_WINDOWS)
+  if(ENABLE_VOIDGLASS_AUDIO_TRACE)
+    target_sources(obs-ffmpeg PRIVATE ../voidglass-audio-trace/audio-trace.c ../voidglass-audio-trace/audio-trace.h)
+    target_compile_definitions(obs-ffmpeg PRIVATE VOIDGLASS_AUDIO_TRACE)
+  endif()
   if(CMAKE_VS_PLATFORM_NAME STREQUAL x64)
     target_sources(obs-ffmpeg PRIVATE texture-amf-opts.hpp texture-amf.cpp)
     target_link_libraries(obs-ffmpeg PRIVATE AMF::AMF)

@@ -6,6 +6,7 @@ project(obs-studio VERSION ${OBS_VERSION_CANONICAL})
 
 if(CMAKE_HOST_SYSTEM_NAME MATCHES "Windows")
   option(ENABLE_VOIDGLASS_RUNTIME_HOOKS "Inject bundled Hooks without shared ProgramData or Vulkan deployment" ON)
+  option(ENABLE_VOIDGLASS_AUDIO_TRACE "Build private STRESS fixture PCM observation taps" OFF)
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/windows/architecture.cmake")
   if(NOT OBS_PARENT_ARCHITECTURE STREQUAL CMAKE_VS_PLATFORM_NAME)
     return()

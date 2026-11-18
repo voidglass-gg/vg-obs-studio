@@ -27,6 +27,10 @@
 #include "obs-ffmpeg-formats.h"
 #include "obs-ffmpeg-compat.h"
 
+#ifdef VOIDGLASS_AUDIO_TRACE
+#include "../voidglass-audio-trace/audio-trace.h"
+#endif
+
 #define do_log(level, format, ...) \
 	blog(level, "[FFmpeg %s encoder: '%s'] " format, enc->type, obs_encoder_get_name(enc->encoder), ##__VA_ARGS__)
 
@@ -53,6 +57,9 @@ struct enc_encoder {
 
 	int frame_size; /* pretty much always 1024 for AAC */
 	int frame_size_bytes;
+#ifdef VOIDGLASS_AUDIO_TRACE
+	struct vg_audio_trace *audio_trace;
+#endif
 };
 
 static const char *aac_getname(void *unused)
@@ -101,6 +108,9 @@ static void enc_destroy(void *data)
 {
 	struct enc_encoder *enc = data;
 
+#ifdef VOIDGLASS_AUDIO_TRACE
+	vg_audio_trace_close(enc->audio_trace);
+#endif
 	if (enc->samples[0])
 		av_freep(&enc->samples[0]);
 
@@ -311,7 +321,12 @@ fail:
 
 static void *aac_create(obs_data_t *settings, obs_encoder_t *encoder)
 {
-	return enc_create(settings, encoder, "aac", NULL, AV_SAMPLE_FMT_NONE);
+	struct enc_encoder *enc = enc_create(settings, encoder, "aac", NULL, AV_SAMPLE_FMT_NONE);
+#ifdef VOIDGLASS_AUDIO_TRACE
+	if (enc && enc->context->sample_fmt == AV_SAMPLE_FMT_FLTP && enc->context->ch_layout.nb_channels == 2)
+		enc->audio_trace = vg_audio_trace_open(VG_AAC_INPUT, obs_data_get_string(settings, "voidglass_audio_trace"));
+#endif
+	return enc;
 }
 
 static void *opus_create(obs_data_t *settings, obs_encoder_t *encoder)
@@ -366,6 +381,15 @@ static bool do_encode(struct enc_encoder *enc, struct encoder_packet *packet, bo
 
 	enc->total_samples += enc->frame_size;
 
+#ifdef VOIDGLASS_AUDIO_TRACE
+	if (enc->audio_trace) {
+		const struct vg_audio_chunk chunk = {.timestamp = (uint64_t)enc->aframe->pts,
+						    .position = obs_encoder_audio_trace_origin(enc->encoder),
+						    .frames = (uint32_t)enc->aframe->nb_samples,
+						    .rate = (uint32_t)enc->context->sample_rate};
+		vg_audio_trace_push(enc->audio_trace, chunk, enc->aframe->data[0], enc->aframe->data[1]);
+	}
+#endif
 	ret = avcodec_send_frame(enc->context, enc->aframe);
 	if (ret == 0)
 		ret = avcodec_receive_packet(enc->context, &avpacket);

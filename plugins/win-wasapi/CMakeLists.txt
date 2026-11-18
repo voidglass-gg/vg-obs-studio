@@ -13,4 +13,9 @@ target_sources(win-wasapi PRIVATE win-wasapi.rc)
 
 target_link_libraries(win-wasapi PRIVATE OBS::libobs Avrt)
 
+if(ENABLE_VOIDGLASS_AUDIO_TRACE)
+  target_sources(win-wasapi PRIVATE ../voidglass-audio-trace/audio-trace.c ../voidglass-audio-trace/audio-trace.h)
+  target_compile_definitions(win-wasapi PRIVATE VOIDGLASS_AUDIO_TRACE)
+endif()
+
 set_target_properties_obs(win-wasapi PROPERTIES FOLDER plugins PREFIX "")

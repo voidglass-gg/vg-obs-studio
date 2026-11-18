@@ -2267,6 +2267,10 @@ EXPORT bool obs_weak_encoder_references_encoder(obs_weak_encoder_t *weak, obs_en
 
 EXPORT void obs_encoder_set_name(obs_encoder_t *encoder, const char *name);
 EXPORT const char *obs_encoder_get_name(const obs_encoder_t *encoder);
+#ifdef VOIDGLASS_AUDIO_TRACE
+/* Audio encoder callback only. QPC nanoseconds for input sample zero. */
+EXPORT uint64_t obs_encoder_audio_trace_origin(const obs_encoder_t *encoder);
+#endif
 
 /** Returns the codec of an encoder by the id */
 EXPORT const char *obs_get_encoder_codec(const char *id);

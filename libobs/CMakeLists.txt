@@ -22,6 +22,9 @@ endif()
 
 add_library(libobs SHARED)
 add_library(OBS::libobs ALIAS libobs)
+if(OS_WINDOWS AND ENABLE_VOIDGLASS_AUDIO_TRACE)
+  target_compile_definitions(libobs PRIVATE VOIDGLASS_AUDIO_TRACE)
+endif()
 
 target_sources(
   libobs

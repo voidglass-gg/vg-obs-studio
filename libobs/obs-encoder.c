@@ -462,6 +462,13 @@ const char *obs_encoder_get_name(const obs_encoder_t *encoder)
 	return obs_encoder_valid(encoder, "obs_encoder_get_name") ? encoder->context.name : NULL;
 }
 
+#ifdef VOIDGLASS_AUDIO_TRACE
+uint64_t obs_encoder_audio_trace_origin(const obs_encoder_t *encoder)
+{
+	return encoder->start_ts;
+}
+#endif
+
 void obs_encoder_set_name(obs_encoder_t *encoder, const char *name)
 {
 	if (!obs_encoder_valid(encoder, "obs_encoder_set_name"))
