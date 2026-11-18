@@ -9,14 +9,23 @@
 enum {
 	RING_SIZE = 64,
 	MAX_FRAMES = 4096,
-	TRACE_BEGIN_SECONDS = 130,
-	TRACE_END_SECONDS = 172,
+	MAX_WINDOWS = 8,
+	MAX_CAPTURE_SECONDS = 42,
 	TRACE_BYTE_LIMIT = 20 * 1024 * 1024,
+};
+
+struct trace_window {
+	uint64_t begin, end;
+};
+
+struct schedule_header {
+	char magic[8];
+	uint64_t frequency, count;
 };
 
 struct trace_header {
 	char magic[8];
-	uint64_t stage, frequency, begin, end;
+	uint64_t stage, frequency, count, armed_qpc;
 };
 
 struct trace_packet {
@@ -31,9 +40,11 @@ struct trace_slot {
 
 struct vg_audio_trace {
 	struct trace_header header;
+	struct trace_window windows[MAX_WINDOWS];
+	wchar_t schedule_path[MAX_PATH];
 	HANDLE file, stop, writer;
 	uint64_t bytes, packets;
-	volatile LONG producer, head, tail;
+	volatile LONG armed, producer, head, tail;
 	volatile LONG64 attempted, lost;
 	bool failed;
 	struct trace_slot slots[RING_SIZE];
@@ -77,15 +88,67 @@ static void drain(struct vg_audio_trace *trace)
 	}
 }
 
+static bool read_exact(HANDLE file, void *data, DWORD size)
+{
+	DWORD read = 0;
+	return ReadFile(file, data, size, &read, NULL) && read == size;
+}
+
+/* The harness publishes a complete schedule by rename at the scenario's QPC origin. */
+static bool load_schedule(struct vg_audio_trace *trace)
+{
+	HANDLE file = CreateFileW(trace->schedule_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+				  FILE_ATTRIBUTE_NORMAL, NULL);
+	if (file == INVALID_HANDLE_VALUE)
+		return false;
+	struct schedule_header header;
+	LARGE_INTEGER size;
+	bool valid = read_exact(file, &header, sizeof(header)) && memcmp(header.magic, "VGAWIN01", 8) == 0 &&
+		     header.frequency == trace->header.frequency && header.count > 0 && header.count <= MAX_WINDOWS &&
+		     GetFileSizeEx(file, &size) &&
+		     size.QuadPart == (LONGLONG)(sizeof(header) + header.count * sizeof(struct trace_window)) &&
+		     read_exact(file, trace->windows, (DWORD)(header.count * sizeof(struct trace_window)));
+	CloseHandle(file);
+	if (!valid)
+		return false;
+
+	const uint64_t budget = MAX_CAPTURE_SECONDS * header.frequency;
+	uint64_t previous_end = 0, total = 0;
+	for (uint64_t i = 0; i < header.count; ++i) {
+		const struct trace_window window = trace->windows[i];
+		if (window.begin == 0 || window.begin < previous_end || window.end <= window.begin ||
+		    window.end - window.begin > budget - total)
+			return false;
+		total += window.end - window.begin;
+		previous_end = window.end;
+	}
+	trace->header.count = header.count;
+	trace->header.armed_qpc = clock_ticks();
+	InterlockedExchange(&trace->armed, 1);
+	return true;
+}
+
+static DWORD writer_wait(const struct vg_audio_trace *trace, uint64_t now)
+{
+	for (uint64_t i = 0; i < trace->header.count; ++i) {
+		if (now < trace->windows[i].begin)
+			return 100;
+		if (now < trace->windows[i].end)
+			return 5;
+	}
+	return INFINITE;
+}
+
 static DWORD WINAPI writer(void *param)
 {
 	struct vg_audio_trace *trace = param;
+	while (!load_schedule(trace) && WaitForSingleObject(trace->stop, 25) == WAIT_TIMEOUT)
+		;
 	write_bytes(trace, &trace->header, sizeof(trace->header));
+	write_bytes(trace, trace->windows, (DWORD)(trace->header.count * sizeof(*trace->windows)));
 	for (;;) {
 		drain(trace);
-		const uint64_t now = clock_ticks();
-		const DWORD wait_ms = now < trace->header.begin ? 100 : (now < trace->header.end ? 5 : INFINITE);
-		if (WaitForSingleObject(trace->stop, wait_ms) != WAIT_TIMEOUT)
+		if (WaitForSingleObject(trace->stop, writer_wait(trace, clock_ticks())) != WAIT_TIMEOUT)
 			break;
 	}
 	drain(trace);
@@ -124,8 +187,7 @@ static const wchar_t *known_label(enum vg_audio_stage stage, const char *label)
 	return NULL;
 }
 
-static struct vg_audio_trace *open_trace(enum vg_audio_stage stage, const wchar_t *path, uint64_t delay,
-					uint64_t duration)
+static struct vg_audio_trace *open_trace(enum vg_audio_stage stage, const wchar_t *path, const wchar_t *schedule)
 {
 	LARGE_INTEGER freq;
 	if (!QueryPerformanceFrequency(&freq))
@@ -133,9 +195,8 @@ static struct vg_audio_trace *open_trace(enum vg_audio_stage stage, const wchar_
 	struct vg_audio_trace *trace = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*trace));
 	if (!trace)
 		return NULL;
-	trace->header = (struct trace_header){"VGATR001", stage, (uint64_t)freq.QuadPart, 0, 0};
-	trace->header.begin = clock_ticks() + delay * trace->header.frequency;
-	trace->header.end = trace->header.begin + duration * trace->header.frequency;
+	trace->header = (struct trace_header){"VGATR002", stage, (uint64_t)freq.QuadPart, 0, 0};
+	wcscpy_s(trace->schedule_path, MAX_PATH, schedule);
 	trace->file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
 	if (trace->file != INVALID_HANDLE_VALUE) {
 		trace->stop = CreateEventW(NULL, TRUE, FALSE, NULL);
@@ -154,19 +215,33 @@ struct vg_audio_trace *vg_audio_trace_open(enum vg_audio_stage stage, const char
 	const wchar_t *name = known_label(stage, label);
 	if (!name)
 		return NULL;
-	wchar_t path[MAX_PATH];
+	wchar_t path[MAX_PATH], schedule[MAX_PATH];
 	const DWORD n = GetEnvironmentVariableW(L"VOIDGLASS_STRESS_AUDIO_TRACE_DIR", path, MAX_PATH);
-	if (n < 3 || n + 28 >= MAX_PATH || path[1] != L':' || (path[2] != L'\\' && path[2] != L'/'))
+	if (n < 3 || n >= MAX_PATH - 28 || path[1] != L':' || (path[2] != L'\\' && path[2] != L'/'))
 		return NULL;
-	if (swprintf_s(path + n, MAX_PATH - n, L"\\%ls.vgat", name) < 0)
+	if (swprintf_s(schedule, MAX_PATH, L"%ls\\schedule.vgw", path) < 0 ||
+	    swprintf_s(path + n, MAX_PATH - n, L"\\%ls.vgat", name) < 0)
 		return NULL;
-	return open_trace(stage, path, TRACE_BEGIN_SECONDS, TRACE_END_SECONDS - TRACE_BEGIN_SECONDS);
+	return open_trace(stage, path, schedule);
+}
+
+static bool in_window(struct vg_audio_trace *trace, uint64_t qpc)
+{
+	if (!load_index(&trace->armed))
+		return false;
+	for (uint64_t i = 0; i < trace->header.count; ++i) {
+		if (qpc < trace->windows[i].begin)
+			return false;
+		if (qpc < trace->windows[i].end)
+			return true;
+	}
+	return false;
 }
 
 static void push_at(struct vg_audio_trace *trace, uint64_t qpc, struct vg_audio_chunk chunk, const void *first,
 		    const void *second)
 {
-	if (qpc < trace->header.begin || qpc >= trace->header.end)
+	if (!in_window(trace, qpc))
 		return;
 	if (InterlockedCompareExchange(&trace->producer, 1, 0)) {
 		InterlockedIncrement64(&trace->attempted);
