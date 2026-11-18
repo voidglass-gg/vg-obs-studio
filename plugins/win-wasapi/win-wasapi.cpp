@@ -433,8 +433,7 @@ WASAPISource::WASAPISource(obs_data_t *settings, obs_source_t *source_, SourceTy
 
 #ifdef VOIDGLASS_AUDIO_TRACE
 	const char *label = obs_source_get_name(source);
-	if (sourceType == SourceType::ProcessOutput && label && window_class == "VoidGlassMediaFixture" &&
-	    title == "media-target" &&
+	if (sourceType == SourceType::ProcessOutput && label &&
 	    ((strcmp(label, "game-audio") == 0 && executable == "stress-game.exe") ||
 	     (strcmp(label, "independent-audio") == 0 && executable == "stress-independent.exe") ||
 	     (strcmp(label, "camera-audio") == 0 && executable == "stress-camera.exe"))) {
@@ -868,7 +867,14 @@ void WASAPISource::Initialize()
 		if (audioTrace) {
 			struct dstr image = {0};
 			ms_get_window_exe(&image, window);
-			traceFixture = image.array && _stricmp(image.array, traceExecutable.c_str()) == 0;
+			wchar_t actual_class[64] = {};
+			wchar_t actual_title[64] = {};
+			const wchar_t *wanted_title = traceExecutable == "stress-independent.exe" ? L"audio-only" : L"media-target";
+			traceFixture = image.array && _stricmp(image.array, traceExecutable.c_str()) == 0 &&
+				       GetClassNameW(window, actual_class, _countof(actual_class)) > 0 &&
+				       wcscmp(actual_class, L"VoidGlassMediaFixture") == 0 &&
+				       GetWindowTextW(window, actual_title, _countof(actual_title)) > 0 &&
+			       wcscmp(actual_title, wanted_title) == 0;
 			dstr_free(&image);
 		}
 #endif
