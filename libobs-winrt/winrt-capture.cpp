@@ -1,4 +1,5 @@
 #include "winrt-capture.h"
+#include "owned-close-queue.hpp"
 
 #include <memory>
 
@@ -39,6 +40,50 @@ template<typename T> static void close_capture_resource(T &resource) noexcept
 		}
 	}
 }
+
+using capture_access_operation = decltype(winrt::Windows::Graphics::Capture::GraphicsCaptureAccess::RequestAccessAsync(
+	winrt::Windows::Graphics::Capture::GraphicsCaptureAccessKind::Borderless));
+
+// No frame, revoker, capture pointer, OBS texture or graphics-context operation
+// is allowed in this bundle. It owns only the retired generation's references.
+struct window_close_bundle {
+	winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool pool{nullptr};
+	winrt::Windows::Graphics::Capture::GraphicsCaptureSession session{nullptr};
+	winrt::Windows::Graphics::Capture::GraphicsCaptureItem item{nullptr};
+	winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice device{nullptr};
+	ComPtr<ID3D11DeviceContext> context;
+	ComPtr<IDXGIDevice> dxgi_device;
+	winrt::com_ptr<IInspectable> inspectable;
+	winrt::Windows::Foundation::IActivationFactory factory{nullptr};
+	winrt::com_ptr<IGraphicsCaptureItemInterop> interop;
+	capture_access_operation access{nullptr};
+	window_close_bundle() noexcept = default;
+};
+
+struct window_close_policy {
+	bool Initialize() noexcept
+	{
+		try {
+			winrt::init_apartment(winrt::apartment_type::multi_threaded);
+			return true;
+		} catch (...) {
+			blog(LOG_ERROR, "WGC Close worker MTA initialization failed (0x%08X)", winrt::to_hresult().value);
+			return false;
+		}
+	}
+	void Close(window_close_bundle &value) noexcept
+	{
+		// Match the legacy pool/session teardown order. This order alone is
+		// not a bound on OS RPC; neither call runs on graphics/control.
+		close_capture_resource(value.pool);
+		close_capture_resource(value.session);
+		// The queue clears ALL remaining references on this MTA worker before
+		// returning its reserved slot. Never call Copy/Flush/ClearState here.
+	}
+	void Uninitialize() noexcept { winrt::uninit_apartment(); }
+};
+using window_close_queue = wgc::OwnedCloseQueue<window_close_bundle, window_close_policy, 32>;
+static window_close_queue window_closes;
 
 extern "C" EXPORT BOOL winrt_capture_supported()
 try {
@@ -140,6 +185,12 @@ struct winrt_capture {
 	DXGI_FORMAT pool_format = DXGI_FORMAT_UNKNOWN;
 	DWORD window_pid = 0;
 	DWORD window_tid = 0;
+	window_close_queue::Lease close_lease;
+	winrt::Windows::Foundation::IActivationFactory capture_factory{nullptr};
+	winrt::com_ptr<IGraphicsCaptureItemInterop> capture_interop;
+	ComPtr<IDXGIDevice> capture_dxgi_device;
+	winrt::com_ptr<IInspectable> capture_inspectable;
+	capture_access_operation capture_access{nullptr};
 
 	bool start_window_capture(ID3D11Device *d3d_device) noexcept;
 	void poll_frame() noexcept;
@@ -262,13 +313,25 @@ void winrt_capture::close_window_capture() noexcept
 	texture_written = false;
 	texture_width = texture_height = 0;
 	++generation;
-	/* Stop the producer before releasing its frame pool. Neither has an
-	 * application callback, so Close cannot wait for OBS graphics to be entered. */
-	close_capture_resource(session);
-	close_capture_resource(frame_pool);
-	context = nullptr;
-	device = nullptr;
-	item = nullptr;
+	if (close_lease) {
+		window_closes.Retire(close_lease, [&](window_close_bundle &owned) noexcept {
+			owned.pool = std::move(frame_pool);
+			owned.session = std::move(session);
+			owned.item = std::move(item);
+			owned.device = std::move(device);
+			owned.context = std::move(context);
+			owned.dxgi_device = std::move(capture_dxgi_device);
+			owned.inspectable = std::move(capture_inspectable);
+			owned.factory = std::move(capture_factory);
+			owned.interop = std::move(capture_interop);
+			owned.access = std::move(capture_access);
+		});
+	} else if (session || frame_pool || context || device || item || capture_factory || capture_interop ||
+		   capture_dxgi_device || capture_inspectable || capture_access) {
+		// An internal ownership violation must never release a final WinRT
+		// reference on graphics, nor use bcrash (whose default handler exits0).
+		std::terminate();
+	}
 }
 
 static gs_color_format window_texture_format(DXGI_FORMAT pixel_format)
@@ -491,16 +554,24 @@ bool winrt_capture::start_window_capture(ID3D11Device *d3d_device) noexcept
 		const DWORD tid = GetWindowThreadProcessId(window, &pid);
 		if (!tid || tid != window_tid || pid != window_pid)
 			return false;
-		auto factory = winrt::get_activation_factory<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>();
-		auto interop = factory.as<IGraphicsCaptureItemInterop>();
-		item = winrt_capture_create_item(interop.get(), window, nullptr);
-		if (!item)
+		close_lease = window_closes.Reserve();
+		if (!close_lease) {
+			const auto pending = window_closes.Snapshot();
+			blog(LOG_WARNING, "WGC Window capture unavailable: Close capacity exhausted or worker unavailable (live=%zu pending=%zu closing=%zu, capacity=32)",
+			     pending.live, pending.pending, pending.closing);
 			return false;
-		ComPtr<IDXGIDevice> dxgi_device;
-		winrt::check_hresult(d3d_device->QueryInterface(&dxgi_device));
-		winrt::com_ptr<IInspectable> inspectable;
-		winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(dxgi_device.Get(), inspectable.put()));
-		device = inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+		}
+		// Reserve before the first WinRT object. Store partial references in
+		// the capture so catch can transfer them; no sole local reference is
+		// released on graphics when a later creation step throws.
+		capture_factory = winrt::get_activation_factory<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>();
+		capture_interop = capture_factory.as<IGraphicsCaptureItemInterop>();
+		winrt::check_hresult(capture_interop->CreateForWindow(
+			window, winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+			reinterpret_cast<void **>(winrt::put_abi(item))));
+		winrt::check_hresult(d3d_device->QueryInterface(&capture_dxgi_device));
+		winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(capture_dxgi_device.Get(), capture_inspectable.put()));
+		device = capture_inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
 		d3d_device->GetImmediateContext(&context);
 		last_size = item.Size();
 		if (last_size.Width <= 0 || last_size.Height <= 0)
@@ -511,9 +582,9 @@ bool winrt_capture::start_window_capture(ID3D11Device *d3d_device) noexcept
 			last_size);
 		session = frame_pool.CreateCaptureSession(item);
 		if (winrt_capture_border_toggle_supported()) {
-			winrt::Windows::Graphics::Capture::GraphicsCaptureAccess::RequestAccessAsync(
-				winrt::Windows::Graphics::Capture::GraphicsCaptureAccessKind::Borderless)
-				.get();
+			capture_access = winrt::Windows::Graphics::Capture::GraphicsCaptureAccess::RequestAccessAsync(
+				winrt::Windows::Graphics::Capture::GraphicsCaptureAccessKind::Borderless);
+			capture_access.get();
 			session.IsBorderRequired(false);
 		}
 		if (capture_cursor)
@@ -870,6 +941,8 @@ extern "C" EXPORT uint32_t winrt_capture_height(const struct winrt_capture *capt
 
 extern "C" EXPORT void winrt_capture_thread_start()
 {
+	if (!window_closes.Start())
+		blog(LOG_ERROR, "WGC Close worker unavailable; new FreeThreaded Window captures will be refused");
 	struct winrt_capture *capture = capture_list;
 	void *const device = gs_get_device_obj();
 	while (capture) {
@@ -885,4 +958,14 @@ extern "C" EXPORT void winrt_capture_thread_stop()
 		winrt_capture_device_loss_release(capture);
 		capture = capture->next;
 	}
+	// obs-video invokes this OUTSIDE graphics, before dispatcher/COM teardown
+	// and before closing its module handle. Every retired generation and its
+	// final Release must finish before the worker can uninitialize or unload.
+	const bool within_warning_threshold = window_closes.StopAndJoin(std::chrono::seconds(5), [] {
+		const auto pending = window_closes.Snapshot();
+		blog(LOG_WARNING, "WGC Close drain INCOMPLETE: still waiting for owned drain after5000ms (live=%zu pending=%zu closing=%zu); retaining join and module lifetime",
+		     pending.live, pending.pending, pending.closing);
+	});
+	if (!within_warning_threshold)
+		blog(LOG_INFO, "WGC Close drain completed; worker joined after warning threshold");
 }

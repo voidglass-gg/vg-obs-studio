@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.25)
+project(wgc_owned_close_cpu_tests LANGUAGES CXX)
+add_executable(VoidGlass-wgc-owned-close-tests owned-close-queue-tests.cpp)
+target_compile_features(VoidGlass-wgc-owned-close-tests PRIVATE cxx_std_17)
+if(MSVC)
+  target_compile_options(VoidGlass-wgc-owned-close-tests PRIVATE /W4 /EHsc /utf-8)
+endif()
