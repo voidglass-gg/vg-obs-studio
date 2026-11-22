@@ -1,4 +1,6 @@
 #include <objbase.h>
+#include <dshow.h>
+#include <wrl/client.h>
 
 #include <obs-module.h>
 #include <obs.hpp>
@@ -187,6 +189,17 @@ static DWORD CALLBACK DShowThread(LPVOID ptr);
 struct DShowInput {
 	obs_source_t *source;
 	Device device;
+	const bool recorderVideoOnly;
+	CriticalSection observationMutex;
+	const char *graphState = "opening";
+	const char *openFailure = "open_failed"; // Owned by the DirectShow worker.
+	uint64_t graphChanged = 0;
+	uint64_t progress = 0;
+	uint64_t timestamp = 0;
+	uint64_t advancingFrames = 0;
+	uint32_t observedWidth = 0;
+	uint32_t observedHeight = 0;
+	uint64_t intervalNs = 0;
 	bool deactivateWhenNotShowing = false;
 	bool deviceHasAudio = false;
 	bool deviceHasSeparateAudioFilter = false;
@@ -215,6 +228,11 @@ struct DShowInput {
 	inline void QueueAction(Action action)
 	{
 		CriticalScope scope(mutex);
+		if (recorderVideoOnly && (action == Action::Activate || action == Action::ActivateBlock)) {
+			CriticalScope observation(observationMutex);
+			graphState = "opening";
+			graphChanged = os_gettime_ns();
+		}
 		actions.push_back(action);
 		ReleaseSemaphore(semaphore, 1, nullptr);
 	}
@@ -229,7 +247,9 @@ struct DShowInput {
 		}
 	}
 
-	inline DShowInput(obs_source_t *source_, obs_data_t *settings) : source(source_), device(InitGraph::False)
+	inline DShowInput(obs_source_t *source_, obs_data_t *settings)
+		: source(source_), device(InitGraph::False),
+		  recorderVideoOnly(obs_data_get_bool(settings, "voidglass_video_only"))
 	{
 		memset(&audio, 0, sizeof(audio));
 		memset(&frame, 0, sizeof(frame));
@@ -281,6 +301,9 @@ struct DShowInput {
 	void OnEncodedAudioData(enum AVCodecID id, unsigned char *data, size_t size, long long ts);
 
 	void OnReactivate();
+	void PublishVideo();
+	void SetGraphState(const char *state);
+	static void GetObservation(void *data, calldata_t *cd);
 	void OnVideoData(const VideoConfig &config, unsigned char *data, size_t size, long long startTime,
 			 long long endTime, long rotation);
 	void OnAudioData(const AudioConfig &config, unsigned char *data, size_t size, long long startTime,
@@ -348,8 +371,15 @@ void DShowInput::DShowLoop()
 
 			obs_data_t *settings;
 			settings = obs_source_get_settings(source);
+			openFailure = "open_failed";
 			if (!Activate(settings)) {
 				obs_source_output_video2(source, nullptr);
+				if (recorderVideoOnly) {
+					device.ShutdownGraph();
+					SetGraphState(openFailure);
+				}
+			} else if (recorderVideoOnly) {
+				SetGraphState("opened");
 			}
 			if (block) {
 				SetEvent(activated_event);
@@ -513,13 +543,50 @@ void DShowInput::OnEncodedVideoData(enum AVCodecID id, unsigned char *data, size
 #if LOG_ENCODED_VIDEO_TS
 		blog(LOG_DEBUG, "video ts: %llu", frame.timestamp);
 #endif
-		obs_source_output_video2(source, &frame);
+		PublishVideo();
 	}
 }
 
 void DShowInput::OnReactivate()
 {
-	SetActive(true);
+	if (!recorderVideoOnly)
+		SetActive(true);
+}
+
+void DShowInput::SetGraphState(const char *state)
+{
+	CriticalScope scope(observationMutex);
+	graphState = state;
+	graphChanged = os_gettime_ns();
+}
+
+void DShowInput::PublishVideo()
+{
+	obs_source_output_video2(source, &frame);
+	if (!recorderVideoOnly || !frame.data[0] || !frame.width || !frame.height)
+		return;
+	CriticalScope scope(observationMutex);
+	if (!advancingFrames || frame.timestamp > timestamp) {
+		++advancingFrames;
+		timestamp = frame.timestamp;
+		progress = os_gettime_ns();
+		observedWidth = frame.width;
+		observedHeight = frame.height;
+	}
+}
+
+void DShowInput::GetObservation(void *data, calldata_t *cd)
+{
+	auto &input = *static_cast<DShowInput *>(data);
+	CriticalScope scope(input.observationMutex);
+	calldata_set_string(cd, "state", input.graphState);
+	calldata_set_int(cd, "changed", input.graphChanged);
+	calldata_set_int(cd, "frames", input.advancingFrames);
+	calldata_set_int(cd, "progress", input.progress);
+	calldata_set_int(cd, "timestamp", input.timestamp);
+	calldata_set_int(cd, "interval", input.intervalNs);
+	calldata_set_int(cd, "width", input.observedWidth);
+	calldata_set_int(cd, "height", input.observedHeight);
 }
 
 void DShowInput::OnVideoData(const VideoConfig &config, unsigned char *data, size_t size, long long startTime,
@@ -611,7 +678,7 @@ void DShowInput::OnVideoData(const VideoConfig &config, unsigned char *data, siz
 		return;
 	}
 
-	obs_source_output_video2(source, &frame);
+	PublishVideo();
 
 	UNUSED_PARAMETER(endTime); /* it's the enndd tiimmes! */
 }
@@ -876,6 +943,38 @@ inline void DShowInput::SetupBuffering(obs_data_t *settings)
 
 static DStr GetVideoFormatName(VideoFormat format);
 
+// A busy device can still have a moniker even when its filter or capture
+// capabilities cannot be opened. Read its identity without binding the filter.
+static bool RecorderDeviceAbsent(const string &requested)
+{
+	using Microsoft::WRL::ComPtr;
+	ComPtr<ICreateDevEnum> devices;
+	if (FAILED(CoCreateInstance(CLSID_SystemDeviceEnum, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&devices))))
+		return false;
+	ComPtr<IEnumMoniker> entries;
+	const HRESULT listed = devices->CreateClassEnumerator(CLSID_VideoInputDeviceCategory, &entries, 0);
+	if (listed != S_OK)
+		return listed == S_FALSE;
+	ComPtr<IMoniker> entry;
+	HRESULT next;
+	while ((next = entries->Next(1, entry.ReleaseAndGetAddressOf(), nullptr)) == S_OK) {
+		ComPtr<IPropertyBag> bag;
+		if (FAILED(entry->BindToStorage(nullptr, nullptr, IID_PPV_ARGS(&bag))))
+			continue;
+		VARIANT name{}, path{};
+		bag->Read(L"FriendlyName", &name, nullptr);
+		bag->Read(L"DevicePath", &path, nullptr);
+		DStr encoded;
+		if (name.vt == VT_BSTR)
+			EncodeDeviceId(encoded, name.bstrVal, path.vt == VT_BSTR ? path.bstrVal : L"");
+		VariantClear(&name);
+		VariantClear(&path);
+		if (encoded->array && requested == encoded->array)
+			return false;
+	}
+	return next == S_FALSE;
+}
+
 bool DShowInput::UpdateVideoConfig(obs_data_t *settings)
 {
 	string video_device_id = obs_data_get_string(settings, VIDEO_DEVICE_ID);
@@ -886,13 +985,36 @@ bool DShowInput::UpdateVideoConfig(obs_data_t *settings)
 
 	DeviceId id;
 	if (!DecodeDeviceId(id, video_device_id.c_str())) {
+		if (recorderVideoOnly)
+			openFailure = "absent";
 		blog(LOG_WARNING, "%s: DecodeDeviceId failed", obs_source_get_name(source));
+		return false;
+	}
+	// An unplugged PnP camera can remain a requested source for hours. Check
+	// its moniker before enumerating capture pins or binding other devices.
+	if (recorderVideoOnly && id.path.rfind(L"\\\\?\\", 0) == 0 && RecorderDeviceAbsent(video_device_id)) {
+		openFailure = "absent";
 		return false;
 	}
 
 	PropertiesData data;
 	Device::EnumVideoDevices(data.devices);
 	VideoDevice dev;
+	if (recorderVideoOnly) {
+		// Match the exact external property value. Never feed a friendly-name
+		// fallback or an ambiguous pathless identifier into libdshowcapture.
+		size_t matches = 0;
+		for (const auto &entry : data.devices) {
+			DStr encoded;
+			EncodeDeviceId(encoded, entry.name.c_str(), entry.path.c_str());
+			if (video_device_id == encoded->array)
+				++matches;
+		}
+		if (matches != 1) {
+			openFailure = matches ? "ambiguous" : RecorderDeviceAbsent(video_device_id) ? "absent" : "open_failed";
+			return false;
+		}
+	}
 	if (!data.GetDevice(dev, video_device_id.c_str())) {
 		blog(LOG_WARNING, "%s: data.GetDevice failed", obs_source_get_name(source));
 		return false;
@@ -1126,6 +1248,12 @@ inline bool DShowInput::Activate(obs_data_t *settings)
 		obs_source_set_audio_active(source, false);
 		return false;
 	}
+	if (recorderVideoOnly) {
+		// ResetGraph has joined the previous graph's sample callbacks.
+		CriticalScope scope(observationMutex);
+		advancingFrames = progress = timestamp = intervalNs = 0;
+		observedWidth = observedHeight = 0;
+	}
 
 	if (!UpdateVideoConfig(settings)) {
 		blog(LOG_WARNING, "%s: Video configuration failed", obs_source_get_name(source));
@@ -1133,7 +1261,11 @@ inline bool DShowInput::Activate(obs_data_t *settings)
 		return false;
 	}
 
-	if (!UpdateAudioConfig(settings)) {
+	if (recorderVideoOnly) {
+		obs_source_set_audio_active(source, false);
+		CriticalScope scope(observationMutex);
+		intervalNs = videoConfig.frameInterval > 0 ? uint64_t(videoConfig.frameInterval) * 100 : 0;
+	} else if (!UpdateAudioConfig(settings)) {
 		blog(LOG_WARNING,
 		     "%s: Audio configuration failed, ignoring "
 		     "audio",
@@ -1210,6 +1342,10 @@ static void *CreateDShowInput(obs_data_t *settings, obs_source_t *source)
 		dshow = new DShowInput(source, settings);
 		proc_handler_t *ph = obs_source_get_proc_handler(source);
 		proc_handler_add(ph, "void activate(bool active)", proc_activate, dshow);
+		if (dshow->recorderVideoOnly)
+			proc_handler_add(ph, "void voidglass_camera_observation(out string state, out int changed, "
+					     "out int frames, out int progress, out int timestamp, out int interval, "
+					     "out int width, out int height)", DShowInput::GetObservation, dshow);
 	} catch (const char *error) {
 		blog(LOG_ERROR, "Could not create device '%s': %s", obs_source_get_name(source), error);
 	}
