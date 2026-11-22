@@ -20,6 +20,7 @@
 #include "../util/base.h"
 #include "../util/bmem.h"
 #include "../util/platform.h"
+#include "../util/voidglass-video-timing.h"
 #include "graphics-internal.h"
 #include "vec2.h"
 #include "vec3.h"
@@ -36,6 +37,7 @@
 #endif
 
 static THREAD_LOCAL graphics_t *thread_graphics = NULL;
+static THREAD_LOCAL uint64_t trace_hold;
 
 static inline bool gs_obj_valid(const void *obj, const char *f, const char *name)
 {
@@ -271,9 +273,6 @@ void gs_destroy(graphics_t *graphics)
 
 	gs_free_image_deps();
 }
-
-#include "../util/voidglass-video-timing.h"
-static THREAD_LOCAL uint64_t trace_hold;
 
 void gs_enter_context(graphics_t *graphics)
 {

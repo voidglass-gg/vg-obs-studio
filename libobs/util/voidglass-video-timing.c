@@ -46,6 +46,9 @@ uint64_t vg_timing_thread_cycles(void)
 
 void vg_timing_event(enum vg_video_stage kind, uint64_t begin, const void *object, uint64_t frame, int64_t a, int64_t b)
 {
+	/* Keep an overflow marker for the reader and stop reserving slots once full. */
+	if (count > TRACE_CAPACITY)
+		return;
 	uint64_t end = os_gettime_ns();
 	LONG i = InterlockedIncrement(&count) - 1;
 	if (i < TRACE_CAPACITY)
