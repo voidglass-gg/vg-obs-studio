@@ -1,0 +1,43 @@
+--- a/dshow-base.cpp
++++ b/dshow-base.cpp
+@@ -106,6 +106,8 @@ struct DeviceFilterCallbackInfo {
+ 	ComPtr<IBaseFilter> filter;
+ 	const wchar_t *name;
+ 	const wchar_t *path;
++	bool exactVideo;
++	bool ambiguous = false;
+ };
+ 
+ static bool GetDeviceCallback(DeviceFilterCallbackInfo &info,
+@@ -115,6 +117,18 @@ static bool GetDeviceCallback(DeviceFilterCallbackInfo &info,
+ 	if (info.name && *info.name && wcscmp(name, info.name) != 0)
+ 		return true;
+ 
++	if (info.exactVideo) {
++		if (wcscmp(path ? path : L"", info.path ? info.path : L"") != 0)
++			return true;
++		if (info.filter != NULL) {
++			info.ambiguous = true;
++			return false;
++		}
++		info.filter = filter;
++		/* Pathless monikers need a unique name in this enumeration. */
++		return !info.path || !*info.path;
++	}
++
+ 	info.filter = filter;
+ 
+ 	/* continue if path does not match */
+@@ -129,10 +143,11 @@ bool GetDeviceFilter(const IID &type, const wchar_t *name, const wchar_t *path,
+ 	DeviceFilterCallbackInfo info;
+ 	info.name = name;
+ 	info.path = path;
++	info.exactVideo = type == CLSID_VideoInputDeviceCategory;
+ 
+ 	if (!EnumDevices(type, EnumDeviceCallback(GetDeviceCallback), &info))
+ 		return false;
+ 
+-	if (info.filter != NULL) {
++	if (info.filter != NULL && !info.ambiguous) {
+ 		*out = info.filter.Detach();
+ 		return true;
