@@ -20,6 +20,7 @@
 
 #include "obs.h"
 #include "obs-internal.h"
+#include "util/voidglass-video-timing.h"
 #include "graphics/vec4.h"
 #include "media-io/format-conversion.h"
 #include "media-io/video-frame.h"
@@ -562,7 +563,9 @@ static inline void render_video(struct obs_core_video_mix *video, bool raw_activ
 		}
 
 		if (video->gpu_conversion) {
+			const uint64_t convert = vg_timing_now();
 			render_convert_texture(video, convert_textures, output_texture);
+			VG_END(VG_CONVERT, convert, video->video, 0, 0, 0);
 		}
 
 		if (gpu_active) {
@@ -571,8 +574,10 @@ static inline void render_video(struct obs_core_video_mix *video, bool raw_activ
 		}
 
 		if (raw_active) {
+			const uint64_t stage = vg_timing_now();
 			stage_output_texture(video, cur_texture, convert_textures, output_texture, copy_surfaces,
 					     channel_count);
+			VG_END(VG_STAGE, stage, video->video, 0, 0, 0);
 		}
 	}
 
@@ -811,6 +816,7 @@ static inline void video_sleep(struct obs_core_video *video, uint64_t *p_time, u
 	uint64_t t = cur_time + interval_ns;
 	int count;
 
+	const uint64_t sleep_begin = vg_timing_now();
 	if (os_sleepto_ns(t)) {
 		*p_time = t;
 		count = 1;
@@ -825,6 +831,7 @@ static inline void video_sleep(struct obs_core_video *video, uint64_t *p_time, u
 
 	video->total_frames += count;
 	video->lagged_frames += count - 1;
+	VG_END(VG_SLEEP, sleep_begin, video, cur_time, count, interval_ns);
 
 	vframe_info.timestamp = cur_time;
 	vframe_info.count = count;
@@ -880,22 +887,30 @@ static inline void output_frame(struct obs_core_video_mix *video)
 	memset(&frame, 0, sizeof(struct video_data));
 
 	profile_start(output_frame_gs_context_name);
+	uint64_t section = vg_timing_now();
 	gs_enter_context(obs->video.graphics);
+	VG_END(VG_GRAPHICS_LOCK, section, video->video, 0, 0, 0);
 
 	profile_start(output_frame_render_video_name);
 	GS_DEBUG_MARKER_BEGIN(GS_DEBUG_COLOR_RENDER_VIDEO, output_frame_render_video_name);
+	section = vg_timing_now();
 	render_video(video, raw_active, gpu_active, cur_texture);
+	VG_END(VG_RENDER, section, video->video, 0, raw_active, gpu_active);
 	GS_DEBUG_MARKER_END();
 	profile_end(output_frame_render_video_name);
 
 	if (raw_active) {
 		profile_start(output_frame_download_frame_name);
+		section = vg_timing_now();
 		frame_ready = download_frame(video, prev_texture, &frame);
+		VG_END(VG_MAP, section, video->video, 0, frame_ready, 0);
 		profile_end(output_frame_download_frame_name);
 	}
 
 	profile_start(output_frame_gs_flush_name);
+	section = vg_timing_now();
 	gs_flush();
+	VG_END(VG_FLUSH, section, video->video, 0, 0, 0);
 	profile_end(output_frame_gs_flush_name);
 
 	gs_leave_context();
@@ -907,7 +922,9 @@ static inline void output_frame(struct obs_core_video_mix *video)
 
 		frame.timestamp = vframe_info.timestamp;
 		profile_start(output_frame_output_video_data_name);
+		section = vg_timing_now();
 		output_video_data(video, &frame, vframe_info.count);
+		VG_END(VG_COPY, section, video->video, frame.timestamp, vframe_info.count, 0);
 		profile_end(output_frame_output_video_data_name);
 	}
 
@@ -917,7 +934,9 @@ static inline void output_frame(struct obs_core_video_mix *video)
 
 static inline void output_frames(void)
 {
+	const uint64_t mix_lock = vg_timing_now();
 	pthread_mutex_lock(&obs->video.mixes_mutex);
+	VG_END(VG_MIX_LOCK, mix_lock, obs, 0, obs->video.mixes.num, 0);
 	for (size_t i = 0, num = obs->video.mixes.num; i < num; i++) {
 		struct obs_core_video_mix *mix = obs->video.mixes.array[i];
 		if (mix->view) {
@@ -1099,6 +1118,8 @@ static inline bool stop_requested(void)
 bool obs_graphics_thread_loop(struct obs_graphics_context *context)
 {
 	uint64_t frame_start = os_gettime_ns();
+	const uint64_t work = vg_timing_now();
+	const uint64_t cycles = vg_timing_thread_cycles();
 	uint64_t frame_time_ns;
 
 	update_active_states();
@@ -1111,7 +1132,9 @@ bool obs_graphics_thread_loop(struct obs_graphics_context *context)
 	gs_leave_context();
 
 	profile_start(tick_sources_name);
+	const uint64_t tick = vg_timing_now();
 	context->last_time = tick_sources(obs->video.video_time, context->last_time);
+	VG_END(VG_TICK, tick, obs, obs->video.video_time, 0, 0);
 	profile_end(tick_sources_name);
 
 #ifdef _WIN32
@@ -1141,6 +1164,7 @@ bool obs_graphics_thread_loop(struct obs_graphics_context *context)
 
 	profile_reenable_thread();
 
+	VG_END(VG_WORK, work, obs, obs->video.video_time, vg_timing_thread_cycles() - cycles, frame_time_ns);
 	video_sleep(&obs->video, &obs->video.video_time, context->interval);
 
 	context->frame_time_total_ns += frame_time_ns;

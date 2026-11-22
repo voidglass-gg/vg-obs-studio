@@ -17,6 +17,7 @@
 
 #include <inttypes.h>
 #include "util/platform.h"
+#include "util/voidglass-video-timing.h"
 #include "util/util_uint64.h"
 #include "util/array-serializer.h"
 #include "graphics/math-extra.h"
@@ -376,6 +377,8 @@ bool obs_output_actual_start(obs_output_t *output)
 	if (success) {
 		output->starting_drawn_count = obs->video.total_frames;
 		output->starting_lagged_count = obs->video.lagged_frames;
+		const uint64_t start = vg_timing_now();
+		VG_END(VG_OUTPUT_START, start, output, 0, output->starting_drawn_count, output->starting_lagged_count);
 	}
 
 	if (os_atomic_load_long(&output->delay_restart_refs))
@@ -430,6 +433,8 @@ static void log_frame_info(struct obs_output *output)
 
 	uint32_t drawn = video->total_frames - output->starting_drawn_count;
 	uint32_t lagged = video->lagged_frames - output->starting_lagged_count;
+	const uint64_t stop = vg_timing_now();
+	VG_END(VG_OUTPUT_END, stop, output, 0, drawn, lagged);
 
 	int dropped = obs_output_get_frames_dropped(output);
 	int total = output->total_frames;

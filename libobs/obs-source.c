@@ -23,6 +23,7 @@
 #include "media-io/audio-io.h"
 #include "util/threading.h"
 #include "util/platform.h"
+#include "util/voidglass-video-timing.h"
 #include "util/util_uint64.h"
 #include "callback/calldata.h"
 #include "graphics/matrix3.h"
@@ -2526,7 +2527,9 @@ static void obs_source_update_async_video(obs_source_t *source)
 			}
 
 			if (source->async_update_texture) {
+				const uint64_t upload = vg_timing_now();
 				update_async_textures(source, frame, source->async_textures, source->async_texrender);
+				VG_END(VG_UPLOAD, upload, source, frame->timestamp, frame->width, frame->height);
 				source->async_update_texture = false;
 			}
 
@@ -3586,6 +3589,8 @@ static void obs_source_output_video_internal(obs_source_t *source, const struct 
 			output = NULL;
 		} else {
 			da_push_back(source->async_frames, &output);
+			const uint64_t queued = vg_timing_now();
+			VG_END(VG_ASYNC_QUEUE, queued, source, output->timestamp, source->async_frames.num, source->async_cache.num);
 			source->async_active = true;
 		}
 	}

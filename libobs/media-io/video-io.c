@@ -23,6 +23,7 @@
 #include "../util/threading.h"
 #include "../util/darray.h"
 #include "../util/util_uint64.h"
+#include "../util/voidglass-video-timing.h"
 
 #include "format-conversion.h"
 #include "video-io.h"
@@ -125,6 +126,7 @@ static inline bool scale_video_output(struct video_input *input, struct video_da
 
 static inline bool video_output_cur_frame(struct video_output *video)
 {
+	const uint64_t consume = vg_timing_now();
 	struct cached_frame_info *frame_info;
 	bool complete;
 	bool skipped;
@@ -165,6 +167,7 @@ static inline bool video_output_cur_frame(struct video_output *video)
 
 	pthread_mutex_lock(&video->data_mutex);
 
+	VG_END(VG_CONSUME, consume, video, frame_info->frame.timestamp, frame_info->count, frame_info->skipped);
 	frame_info->frame.timestamp += video->frame_time;
 	complete = --frame_info->count == 0;
 	skipped = frame_info->skipped > 0;
@@ -451,6 +454,8 @@ bool video_output_connect2(video_t *video, const struct video_scale_info *conver
 static void log_skipped(video_t *video)
 {
 	long skipped = os_atomic_load_long(&video->skipped_frames);
+	const uint64_t snapshot = vg_timing_now();
+	VG_END(VG_VIDEO_END, snapshot, video, 0, skipped, os_atomic_load_long(&video->total_frames));
 	double percentage_skipped = (double)skipped / (double)os_atomic_load_long(&video->total_frames) * 100.0;
 
 	if (skipped)
@@ -508,6 +513,7 @@ const struct video_output_info *video_output_get_info(const video_t *video)
 
 bool video_output_lock_frame(video_t *video, struct video_frame *frame, int count, uint64_t timestamp)
 {
+	const uint64_t lock = vg_timing_now();
 	struct cached_frame_info *cfi;
 	bool locked;
 
@@ -539,6 +545,7 @@ bool video_output_lock_frame(video_t *video, struct video_frame *frame, int coun
 		locked = true;
 	}
 
+	VG_END(VG_CACHE, lock, video, timestamp, video->info.cache_size - video->available_frames, locked ? count : -count);
 	pthread_mutex_unlock(&video->data_mutex);
 
 	return locked;

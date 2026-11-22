@@ -111,6 +111,8 @@ target_sources(
     util/pipe.c
     util/pipe.h
     util/platform.c
+    util/voidglass-video-timing.c
+    util/voidglass-video-timing.h
     util/platform.h
     util/profiler.c
     util/profiler.h

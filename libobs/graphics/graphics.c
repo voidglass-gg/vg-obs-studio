@@ -272,6 +272,9 @@ void gs_destroy(graphics_t *graphics)
 	gs_free_image_deps();
 }
 
+#include "../util/voidglass-video-timing.h"
+static THREAD_LOCAL uint64_t trace_hold;
+
 void gs_enter_context(graphics_t *graphics)
 {
 	if (!ptr_valid(graphics, "gs_enter_context"))
@@ -284,7 +287,11 @@ void gs_enter_context(graphics_t *graphics)
 	}
 
 	if (!is_current) {
+		const uint64_t wait = vg_timing_now();
 		pthread_mutex_lock(&graphics->mutex);
+		trace_hold = vg_timing_now();
+		if (wait && trace_hold - wait >= 1000000)
+			VG_END(VG_CONTEXT_WAIT, wait, graphics, 0, 0, 0);
 		graphics->exports.device_enter_context(graphics->device);
 		thread_graphics = graphics;
 	}
@@ -300,6 +307,8 @@ void gs_leave_context(void)
 
 			graphics->exports.device_leave_context(graphics->device);
 			pthread_mutex_unlock(&graphics->mutex);
+			if (trace_hold && vg_timing_now() - trace_hold >= 1000000)
+				VG_END(VG_CONTEXT_HOLD, trace_hold, graphics, 0, 0, 0);
 			thread_graphics = NULL;
 		}
 	}

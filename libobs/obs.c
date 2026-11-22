@@ -19,6 +19,7 @@
 
 #include "graphics/matrix4.h"
 #include "callback/calldata.h"
+#include "util/voidglass-video-timing.h"
 
 #include "obs.h"
 #include "obs-internal.h"
@@ -1330,6 +1331,7 @@ bool obs_startup(const char *locale, const char *module_config_path, profiler_na
 	com_initialized = initialize_com();
 #endif
 
+	vg_timing_init();
 	success = obs_init(locale, module_config_path, store);
 	profile_end(obs_startup_name);
 	if (!success)
@@ -1469,6 +1471,7 @@ void obs_shutdown(void)
 	bfree(obs);
 	obs = NULL;
 	bfree(cmdline_args.argv);
+	vg_timing_finish();
 
 #ifdef _WIN32
 	if (com_initialized)

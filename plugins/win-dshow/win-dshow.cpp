@@ -6,6 +6,7 @@
 #include <obs.hpp>
 #include <util/dstr.hpp>
 #include <util/platform.h>
+#include <util/voidglass-video-timing.h>
 #include <util/windows/WinHandle.hpp>
 #include <util/threading.h>
 #ifdef OBS_LEGACY
@@ -522,7 +523,10 @@ void DShowInput::OnEncodedVideoData(enum AVCodecID id, unsigned char *data, size
 	}
 
 	bool got_output;
+	const uint64_t decode = vg_timing_now();
+	const uint64_t device_ts = (uint64_t)ts * 100;
 	bool success = ffmpeg_decode_video(video_decoder, data, size, &ts, cs, frame.range, &frame, &got_output);
+	VG_END(VG_DECODE, decode, source, device_ts, success && got_output, size);
 	if (!success) {
 		blog(LOG_WARNING, "%s: Error decoding video", obs_source_get_name(source));
 		return;
@@ -554,7 +558,9 @@ void DShowInput::SetGraphState(const char *state)
 
 void DShowInput::PublishVideo()
 {
+	const uint64_t publish = vg_timing_now();
 	obs_source_output_video2(source, &frame);
+	VG_END(VG_PUBLISH, publish, source, frame.timestamp, frame.width, frame.height);
 	if (!recorderVideoOnly || !frame.data[0] || !frame.width || !frame.height)
 		return;
 	CriticalScope scope(observationMutex);
@@ -570,6 +576,7 @@ void DShowInput::PublishVideo()
 void DShowInput::GetObservation(void *data, calldata_t *cd)
 {
 	auto &input = *static_cast<DShowInput *>(data);
+	const uint64_t observe = vg_timing_now();
 	CriticalScope scope(input.observationMutex);
 	calldata_set_string(cd, "state", input.graphState);
 	calldata_set_int(cd, "changed", input.graphChanged);
@@ -579,11 +586,14 @@ void DShowInput::GetObservation(void *data, calldata_t *cd)
 	calldata_set_int(cd, "interval", input.intervalNs);
 	calldata_set_int(cd, "width", input.observedWidth);
 	calldata_set_int(cd, "height", input.observedHeight);
+	VG_END(VG_OBSERVE, observe, input.source, input.timestamp, input.advancingFrames, 0);
 }
 
 void DShowInput::OnVideoData(const VideoConfig &config, unsigned char *data, size_t size, long long startTime,
 			     long long endTime, long rotation)
 {
+	const uint64_t arrival = vg_timing_now();
+	VG_END(VG_ARRIVE, arrival, source, (uint64_t)startTime * 100, size, endTime - startTime);
 	if (autorotation && rotation != lastRotation) {
 		lastRotation = rotation;
 		obs_source_set_async_rotation(source, rotation);

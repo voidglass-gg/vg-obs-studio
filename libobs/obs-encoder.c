@@ -18,6 +18,7 @@
 #include "obs.h"
 #include "obs-internal.h"
 #include "util/util_uint64.h"
+#include "util/voidglass-video-timing.h"
 
 #define encoder_active(encoder) os_atomic_load_bool(&encoder->active)
 #define set_encoder_active(encoder, val) os_atomic_set_bool(&encoder->active, val)
@@ -1416,9 +1417,11 @@ bool do_encode(struct obs_encoder *encoder, struct encoder_frame *frame, const u
 	 * needs to be read just before the encode request.
 	 */
 	fer_ts = os_gettime_ns();
+	const uint64_t measure = frame_cts ? vg_timing_now() : 0;
 
 	profile_start(encoder->profile_encoder_encode_name);
 	success = encoder->info.encode(encoder->context.data, frame, &pkt, &received);
+	VG_END(VG_ENCODE, measure, encoder, *frame_cts, frame->pts, received ? (int64_t)pkt.size : 0);
 	profile_end(encoder->profile_encoder_encode_name);
 
 	/* Generate and enqueue the frame timing metrics, namely
@@ -1438,7 +1441,9 @@ bool do_encode(struct obs_encoder *encoder, struct encoder_frame *frame, const u
 		ept->cts = *frame_cts;
 		ept->fer = fer_ts;
 	}
+	const uint64_t send = measure ? vg_timing_now() : 0;
 	send_off_encoder_packet(encoder, success, received, &pkt);
+	VG_END(VG_PACKET, send, encoder, *frame_cts, frame->pts, received);
 
 	profile_end(do_encode_name);
 
