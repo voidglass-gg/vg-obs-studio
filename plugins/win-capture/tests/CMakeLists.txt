@@ -14,5 +14,11 @@ target_include_directories(voidglass-provenance-cache PRIVATE .. "${CMAKE_SOURCE
 target_link_libraries(voidglass-provenance-cache PRIVATE OBS::hook-config bcrypt.lib)
 target_compile_features(voidglass-provenance-cache PRIVATE cxx_std_17)
 
+find_package(Detours REQUIRED)
+add_executable(voidglass-dxgi-present-depth dxgi-present-depth.cpp)
+target_compile_definitions(voidglass-dxgi-present-depth PRIVATE COMPILE_VULKAN_HOOK=1)
+target_link_libraries(voidglass-dxgi-present-depth PRIVATE OBS::hook-config OBS::ipc-util Detours::Detours dxguid)
+target_compile_features(voidglass-dxgi-present-depth PRIVATE cxx_std_17)
+
 add_executable(voidglass-injector-lifecycle injector-lifecycle.cpp)
 target_compile_features(voidglass-injector-lifecycle PRIVATE cxx_std_17)
