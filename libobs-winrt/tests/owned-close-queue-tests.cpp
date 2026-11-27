@@ -1,4 +1,5 @@
 #include "../owned-close-queue.hpp"
+#include "../border-access.hpp"
 #include <atomic>
 #include <future>
 #include <iostream>
@@ -208,9 +209,83 @@ static void FailedInitializationAndPartialCreation()
 		"Partial references and Close-error final releases stay on the worker, with no leaked reservation");
 }
 
+struct ConsentReply {
+	enum class Status { Started, Completed, Canceled, Error } status = Status::Started;
+	enum class Access { Denied, Allowed } access = Access::Denied;
+	unsigned reads = 0;
+	bool fail_results = false;
+};
+struct ConsentOperation {
+	ConsentReply *reply;
+	ConsentOperation(ConsentReply *value) : reply(value) {}
+	explicit operator bool() const { return reply != nullptr; }
+	auto Status() const { return reply->status; }
+	auto GetResults() const
+	{
+		++reply->reads;
+		if (reply->fail_results) throw std::runtime_error("results");
+		return reply->access;
+	}
+};
+struct BorderSession {
+	mutable unsigned hides = 0;
+	bool fail = false;
+	void IsBorderRequired(bool required) const
+	{
+		if (fail || required) throw std::runtime_error("border");
+		++hides;
+	}
+};
+
+static void OptionalBorderConsent()
+{
+	wgc::BorderAccess<ConsentOperation> consent;
+	BorderSession first, replacement;
+	ConsentReply old, current;
+	consent.Begin([&] { return &old; });
+	consent.Poll(first);
+	Check(!first.hides && !old.reads, "pending consent leaves the started session bordered");
+	auto retired = consent.Retire();
+	old.status = ConsentReply::Status::Completed;
+	old.access = ConsentReply::Access::Allowed;
+	consent.Poll(first);
+	consent.Begin([&] { return &current; });
+	consent.Poll(replacement);
+	Check(retired && !old.reads && !first.hides && !replacement.hides, "late grant touches neither session");
+	current.status = ConsentReply::Status::Completed;
+	consent.Poll(replacement);
+	Check(current.reads == 1 && !replacement.hides, "denial keeps capture bordered");
+	for (auto status : {ConsentReply::Status::Error, ConsentReply::Status::Canceled}) {
+		current.status = status;
+		consent.Begin([&] { return &current; });
+		consent.Poll(replacement);
+	}
+	consent.Begin([]() -> ConsentOperation { throw std::runtime_error("unavailable"); });
+	consent.Poll(replacement);
+	Check(current.reads == 1 && !replacement.hides, "unavailable, error and canceled consent are optional");
+	current.status = ConsentReply::Status::Completed;
+	current.access = ConsentReply::Access::Allowed;
+	current.fail_results = true;
+	consent.Begin([&] { return &current; });
+	consent.Poll(replacement);
+	Check(!replacement.hides, "failed result leaves border enabled");
+	current.fail_results = false;
+	replacement.fail = true;
+	consent.Begin([&] { return &current; });
+	consent.Poll(replacement);
+	replacement.fail = false;
+	consent.Poll(replacement);
+	Check(!replacement.hides, "failed property update is contained");
+	consent.Begin([&] { return &current; });
+	consent.Poll(replacement);
+	consent.Poll(replacement);
+	Check(replacement.hides == 1 && !first.hides, "allowed live session hides border once");
+}
+
 int main()
 {
 	try {
+		OptionalBorderConsent();
 		BlockedCloseKeepsProducerAndControlResponsive();
 		WarningThresholdCannotAuthorizeUnload();
 		FailedInitializationAndPartialCreation();

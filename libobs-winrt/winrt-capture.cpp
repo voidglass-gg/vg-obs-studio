@@ -1,5 +1,6 @@
 #include "winrt-capture.h"
 #include "owned-close-queue.hpp"
+#include "border-access.hpp"
 
 #include <memory>
 
@@ -190,7 +191,8 @@ struct winrt_capture {
 	winrt::com_ptr<IGraphicsCaptureItemInterop> capture_interop;
 	ComPtr<IDXGIDevice> capture_dxgi_device;
 	winrt::com_ptr<IInspectable> capture_inspectable;
-	capture_access_operation capture_access{nullptr};
+	wgc::BorderAccess<capture_access_operation> border_access;
+	void request_border_access() noexcept;
 
 	bool start_window_capture(ID3D11Device *d3d_device) noexcept;
 	void poll_frame() noexcept;
@@ -324,10 +326,10 @@ void winrt_capture::close_window_capture() noexcept
 			owned.inspectable = std::move(capture_inspectable);
 			owned.factory = std::move(capture_factory);
 			owned.interop = std::move(capture_interop);
-			owned.access = std::move(capture_access);
+			owned.access = border_access.Retire();
 		});
 	} else if (session || frame_pool || context || device || item || capture_factory || capture_interop ||
-		   capture_dxgi_device || capture_inspectable || capture_access) {
+		   capture_dxgi_device || capture_inspectable || border_access) {
 		// An internal ownership violation must never release a final WinRT
 		// reference on graphics, nor use bcrash (whose default handler exits0).
 		std::terminate();
@@ -377,10 +379,12 @@ bool winrt_capture::copy_texture(ID3D11Texture2D *surface, const D3D11_BOX &box,
 
 void winrt_capture::poll_frame() noexcept
 {
-	if (!free_threaded || !obs_in_task_thread(OBS_TASK_GRAPHICS))
+	if (!obs_in_task_thread(OBS_TASK_GRAPHICS))
 		return;
 	capture_graphics_scope graphics(true);
-	if (polling || !active || !frame_pool)
+	if (active)
+		border_access.Poll(session);
+	if (!free_threaded || polling || !active || !frame_pool)
 		return;
 	struct polling_scope {
 		bool &flag;
@@ -468,6 +472,7 @@ static void winrt_capture_device_loss_release(void *data)
 		return;
 	}
 	capture->active = FALSE;
+	capture->border_access.Retire();
 
 	capture->frame_arrived.revoke();
 
@@ -507,6 +512,15 @@ try {
 } catch (...) {
 	blog(LOG_ERROR, "winrt_capture_border_toggle_supported (0x%08X)", winrt::to_hresult().value);
 	return false;
+}
+
+void winrt_capture::request_border_access() noexcept
+{
+	if (winrt_capture_border_toggle_supported())
+		border_access.Begin([] {
+			return winrt::Windows::Graphics::Capture::GraphicsCaptureAccess::RequestAccessAsync(
+				winrt::Windows::Graphics::Capture::GraphicsCaptureAccessKind::Borderless);
+		});
 }
 
 static winrt::Windows::Graphics::Capture::GraphicsCaptureItem
@@ -581,16 +595,11 @@ bool winrt_capture::start_window_capture(ID3D11Device *d3d_device) noexcept
 			device, static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(pool_format), 2,
 			last_size);
 		session = frame_pool.CreateCaptureSession(item);
-		if (winrt_capture_border_toggle_supported()) {
-			capture_access = winrt::Windows::Graphics::Capture::GraphicsCaptureAccess::RequestAccessAsync(
-				winrt::Windows::Graphics::Capture::GraphicsCaptureAccessKind::Borderless);
-			capture_access.get();
-			session.IsBorderRequired(false);
-		}
 		if (capture_cursor)
 			session.IsCursorCaptureEnabled(cursor_visible);
 		session.StartCapture();
 		active = TRUE;
+		request_border_access();
 		return true;
 	} catch (...) {
 		blog(LOG_WARNING, "WGC window start/rebuild failed (0x%08X)", winrt::to_hresult().value);
@@ -633,13 +642,6 @@ static void winrt_capture_device_loss_rebuild(void *device_void, void *data)
 			capture->last_size);
 	const winrt::Windows::Graphics::Capture::GraphicsCaptureSession session = frame_pool.CreateCaptureSession(item);
 
-	if (winrt_capture_border_toggle_supported()) {
-		winrt::Windows::Graphics::Capture::GraphicsCaptureAccess::RequestAccessAsync(
-			winrt::Windows::Graphics::Capture::GraphicsCaptureAccessKind::Borderless)
-			.get();
-		session.IsBorderRequired(false);
-	}
-
 	if (winrt_capture_cursor_toggle_supported())
 		session.IsCursorCaptureEnabled(capture->capture_cursor && capture->cursor_visible);
 
@@ -654,6 +656,7 @@ static void winrt_capture_device_loss_rebuild(void *device_void, void *data)
 	try {
 		session.StartCapture();
 		capture->active = TRUE;
+		capture->request_border_access();
 	} catch (winrt::hresult_error &err) {
 		blog(LOG_ERROR, "StartCapture (0x%08X): %s", err.code().value, winrt::to_string(err.message()).c_str());
 	} catch (...) {
@@ -716,13 +719,6 @@ try {
 			device, static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(format), 2, size);
 	const winrt::Windows::Graphics::Capture::GraphicsCaptureSession session = frame_pool.CreateCaptureSession(item);
 
-	if (winrt_capture_border_toggle_supported()) {
-		winrt::Windows::Graphics::Capture::GraphicsCaptureAccess::RequestAccessAsync(
-			winrt::Windows::Graphics::Capture::GraphicsCaptureAccessKind::Borderless)
-			.get();
-		session.IsBorderRequired(false);
-	}
-
 	/* disable cursor capture if possible since ours performs better */
 	const BOOL cursor_toggle_supported = winrt_capture_cursor_toggle_supported();
 	if (cursor_toggle_supported)
@@ -750,6 +746,7 @@ try {
 
 	session.StartCapture();
 	capture->active = TRUE;
+	capture->request_border_access();
 
 	gs_device_loss callbacks;
 	callbacks.device_loss_release = winrt_capture_device_loss_release;
