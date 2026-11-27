@@ -152,6 +152,8 @@ static int voidglass_finish_helper(struct ffmpeg_muxer *stream)
 	return code;
 }
 
+static void voidglass_preflight_command(void *data, calldata_t *cd);
+
 static void voidglass_file_opened_handle(void *data, calldata_t *cd)
 {
 	struct ffmpeg_muxer *stream = data;
@@ -192,6 +194,7 @@ static void ffmpeg_mux_destroy(void *data)
 	if (stream->file_opened_event) {
 		if (stream->pipe)
 			voidglass_finish_helper(stream);
+		os_process_args_destroy(stream->prepared_args);
 		CloseHandle(stream->file_opened_event);
 		pthread_mutex_destroy(&stream->observer_mutex);
 		bfree(stream->file_opened_event_name);
@@ -249,6 +252,8 @@ static void *ffmpeg_mux_create(obs_data_t *settings, obs_output_t *output)
 		stream->file_opened_event = event;
 		stream->file_opened_event_name = name;
 		dstr_copy(&stream->voidglass_log_context, obs_data_get_string(settings, "voidglass_log_context"));
+		proc_handler_add(ph, "void voidglass_preflight_command(out bool fits, out int units)",
+				 voidglass_preflight_command, stream);
 		proc_handler_add(ph, "void voidglass_file_opened_handle(out ptr handle)", voidglass_file_opened_handle,
 				 stream);
 		proc_handler_add(ph, "void voidglass_set_packet_observer(ptr callback, ptr param)",
@@ -349,7 +354,7 @@ static void add_video_encoder_params(struct ffmpeg_muxer *stream, os_process_arg
 	os_process_args_add_argf(args, "%d", codec_tag);
 }
 
-static void add_audio_encoder_params(os_process_args_t *args, obs_encoder_t *aencoder)
+static void add_audio_encoder_params(os_process_args_t *args, obs_encoder_t *aencoder, bool bounded_label)
 {
 	obs_data_t *settings = obs_encoder_get_settings(aencoder);
 	int bitrate = (int)obs_data_get_int(settings, "bitrate");
@@ -357,7 +362,17 @@ static void add_audio_encoder_params(os_process_args_t *args, obs_encoder_t *aen
 
 	obs_data_release(settings);
 
-	os_process_args_add_arg(args, obs_encoder_get_name(aencoder));
+	const char *name = obs_encoder_get_name(aencoder);
+	char label[256];
+	if (bounded_label && strlen(name) >= sizeof(label)) {
+		size_t end = sizeof(label) - 1;
+		while (end && ((unsigned char)name[end] & 0xC0) == 0x80)
+			--end;
+		memcpy(label, name, end);
+		label[end] = 0;
+		name = label;
+	}
+	os_process_args_add_arg(args, name);
 	os_process_args_add_argf(args, "%d", bitrate);
 	os_process_args_add_argf(args, "%d", (int)obs_encoder_get_sample_rate(aencoder));
 	os_process_args_add_argf(args, "%d", (int)obs_encoder_get_frame_size(aencoder));
@@ -433,7 +448,6 @@ static void build_command_line(struct ffmpeg_muxer *stream, os_process_args_t **
 	*args = os_process_args_create(exe);
 	bfree(exe);
 
-	dstr_copy(&stream->path, path);
 	os_process_args_add_arg(*args, path);
 	os_process_args_add_argf(*args, "%d", vencoder ? 1 : 0);
 	os_process_args_add_argf(*args, "%d", num_tracks);
@@ -444,8 +458,13 @@ static void build_command_line(struct ffmpeg_muxer *stream, os_process_args_t **
 	if (num_tracks) {
 		os_process_args_add_arg(*args, obs_encoder_get_codec(aencoders[0]));
 
+#ifdef _WIN32
+		const bool bounded_label = stream->file_opened_event != NULL;
+#else
+		const bool bounded_label = false;
+#endif
 		for (int i = 0; i < num_tracks; i++) {
-			add_audio_encoder_params(*args, aencoders[i]);
+			add_audio_encoder_params(*args, aencoders[i], bounded_label);
 		}
 	}
 
@@ -457,10 +476,42 @@ static void build_command_line(struct ffmpeg_muxer *stream, os_process_args_t **
 #endif
 }
 
+#ifdef _WIN32
+static void voidglass_preflight_command(void *data, calldata_t *cd)
+{
+	struct ffmpeg_muxer *stream = data;
+	pthread_mutex_lock(&stream->observer_mutex);
+	if (!stream->exclusive_started) {
+		obs_data_t *settings = obs_output_get_settings(stream->output);
+		os_process_args_t *args = NULL;
+		build_command_line(stream, &args, obs_data_get_string(settings, "path"));
+		obs_data_release(settings);
+		const size_t units = os_process_args_windows_command_line_size(args);
+		const bool fits = units && units <= OS_WINDOWS_COMMAND_LINE_LIMIT;
+		calldata_set_int(cd, "units", (long long)units);
+		calldata_set_bool(cd, "fits", fits);
+		os_process_args_destroy(stream->prepared_args);
+		stream->prepared_args = fits ? args : NULL;
+		if (!fits)
+			os_process_args_destroy(args);
+	}
+	pthread_mutex_unlock(&stream->observer_mutex);
+}
+#endif
+
 void start_pipe(struct ffmpeg_muxer *stream, const char *path)
 {
 	os_process_args_t *args = NULL;
-	build_command_line(stream, &args, path);
+#ifdef _WIN32
+	/* Exclusive start sealed these arguments before the Recorder committed the group. */
+	if (stream->file_opened_event) {
+		args = stream->prepared_args;
+		stream->prepared_args = NULL;
+	}
+#endif
+	if (!args)
+		build_command_line(stream, &args, path);
+	dstr_copy(&stream->path, path);
 	stream->pipe = os_process_pipe_create2(args, "w");
 	os_process_args_destroy(args);
 }

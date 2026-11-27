@@ -66,6 +66,7 @@ struct ffmpeg_muxer {
 	bool split_file;
 	bool allow_overwrite;
 #ifdef _WIN32
+	os_process_args_t *prepared_args;
 	void *file_opened_event;
 	char *file_opened_event_name;
 	struct dstr voidglass_log_context;

@@ -32,6 +32,9 @@ EXPORT os_process_pipe_t *os_process_pipe_create(const char *cmd_line, const cha
 EXPORT os_process_pipe_t *os_process_pipe_create2(const os_process_args_t *args, const char *type);
 EXPORT int os_process_pipe_destroy(os_process_pipe_t *pp);
 #ifdef _WIN32
+/* CreateProcessW counts UTF-16 code units, including the terminating NUL. */
+#define OS_WINDOWS_COMMAND_LINE_LIMIT 32767
+EXPORT size_t os_process_args_windows_command_line_size(const os_process_args_t *args);
 /* Send EOF to the child while leaving its stderr available for draining. */
 EXPORT bool os_process_pipe_close_input(os_process_pipe_t *pp);
 #endif

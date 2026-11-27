@@ -149,7 +149,7 @@ static inline void add_backslashes(struct dstr *str, size_t count)
 		dstr_cat_ch(str, '\\');
 }
 
-os_process_pipe_t *os_process_pipe_create2(const os_process_args_t *args, const char *type)
+static struct dstr windows_command_line(const os_process_args_t *args)
 {
 	struct dstr cmd_line = {0};
 
@@ -197,6 +197,20 @@ os_process_pipe_t *os_process_pipe_create2(const os_process_args_t *args, const 
 		argv++;
 	}
 
+	return cmd_line;
+}
+
+size_t os_process_args_windows_command_line_size(const os_process_args_t *args)
+{
+	struct dstr cmd_line = windows_command_line(args);
+	const size_t units = os_utf8_to_wcs(cmd_line.array, 0, NULL, 0);
+	dstr_free(&cmd_line);
+	return units ? units + 1 : 0;
+}
+
+os_process_pipe_t *os_process_pipe_create2(const os_process_args_t *args, const char *type)
+{
+	struct dstr cmd_line = windows_command_line(args);
 	os_process_pipe_t *ret = os_process_pipe_create(cmd_line.array, type);
 
 	dstr_free(&cmd_line);
