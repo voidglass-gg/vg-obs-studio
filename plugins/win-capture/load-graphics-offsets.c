@@ -1,3 +1,4 @@
+#include "voidglass-module-files.h"
 #include <obs-module.h>
 #include <util/windows/win-version.h>
 #include <util/platform.h>
@@ -142,11 +143,12 @@ failed:
 bool load_graphics_offsets(bool is32bit, bool use_hook_address_cache, const char *config_path)
 {
 	char *offset_exe_path = NULL;
+	vg_dll_file *checked = NULL;
 	struct dstr config_ini = {0};
 	struct dstr offset_exe = {0};
 	struct dstr str = {0};
 	struct dstr cmd = {0};
-	os_process_pipe_t *pp;
+	os_process_pipe_t *pp = NULL;
 	bool success = false;
 	char data[2048];
 
@@ -156,10 +158,22 @@ bool load_graphics_offsets(bool is32bit, bool use_hook_address_cache, const char
 	}
 #endif
 
+	checked = bzalloc(sizeof(*checked));
 	dstr_copy(&offset_exe, "get-graphics-offsets");
 	dstr_cat(&offset_exe, is32bit ? "32.exe" : "64.exe");
 	offset_exe_path = obs_module_file(offset_exe.array);
 
+	if (!checked || !vg_module_open(offset_exe_path, is32bit ? IMAGE_FILE_MACHINE_I386 : IMAGE_FILE_MACHINE_AMD64,
+					false, checked)) {
+		blog(LOG_WARNING, "load_graphics_offsets: rejected non-installed file or incorrect architecture");
+		bfree(offset_exe_path);
+		goto error;
+	}
+	bfree(offset_exe_path);
+	offset_exe_path = NULL;
+	os_wcs_to_utf8_ptr(checked->path, 0, &offset_exe_path);
+	if (!offset_exe_path)
+		goto error;
 	dstr_init_move_array(&cmd, offset_exe_path);
 	dstr_insert_ch(&cmd, 0, '\"');
 	dstr_cat(&cmd, "\"");
@@ -198,10 +212,12 @@ bool load_graphics_offsets(bool is32bit, bool use_hook_address_cache, const char
 	if (!success) {
 		blog(LOG_INFO, "load_graphics_offsets: Failed to load string");
 	}
-
-	os_process_pipe_destroy(pp);
-
 error:
+	if (pp)
+		os_process_pipe_destroy(pp);
+	if (checked)
+		vg_dll_close(checked);
+	bfree(checked);
 	dstr_free(&offset_exe);
 	dstr_free(&str);
 	dstr_free(&cmd);

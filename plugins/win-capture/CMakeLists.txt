@@ -26,6 +26,11 @@ find_package(jansson REQUIRED)
 add_library(win-capture MODULE)
 add_library(OBS::capture ALIAS win-capture)
 
+target_compile_features(win-capture PRIVATE cxx_std_17)
+if(MSVC)
+  set_source_files_properties(voidglass-injector.cpp PROPERTIES COMPILE_OPTIONS /EHsc)
+endif()
+
 target_sources(
   win-capture
   PRIVATE
@@ -43,12 +48,17 @@ target_sources(
     duplicator-monitor-capture.c
     game-capture-file-init.c
     game-capture.c
+    voidglass-injector.cpp
+    voidglass-injector.h
+    voidglass-injector-owner.hpp
     load-graphics-offsets.c
     monitor-capture.c
     nt-stuff.c
     nt-stuff.h
     plugin-main.c
     window-capture.c
+    voidglass-module-files.h
+    voidglass-provenance-cache.h
 )
 
 target_compile_definitions(
@@ -56,6 +66,7 @@ target_compile_definitions(
   PRIVATE
     COMPAT_URL="${COMPAT_URL}"
     "$<$<BOOL:${ENABLE_COMPAT_UPDATES}>:ENABLE_COMPAT_UPDATES>"
+    "$<$<BOOL:${ENABLE_VOIDGLASS_RUNTIME_HOOKS}>:VOIDGLASS_RUNTIME_HOOKS>"
     OBS_VERSION="${OBS_VERSION_CANONICAL}"
 )
 
@@ -70,6 +81,7 @@ target_link_libraries(
     OBS::obfuscate
     OBS::w32-pthreads
     OBS::winrt-headers
+    bcrypt.lib
     jansson::jansson
 )
 
@@ -84,3 +96,7 @@ set_target_properties_obs(win-capture PROPERTIES FOLDER plugins/win-capture PREF
 add_subdirectory(graphics-hook)
 add_subdirectory(get-graphics-offsets)
 add_subdirectory(inject-helper)
+
+if(ENABLE_UNIT_TESTS)
+  add_subdirectory(tests)
+endif()

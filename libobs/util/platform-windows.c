@@ -88,9 +88,12 @@ void *os_dlopen(const char *path)
 		wchar_t fullpath[MAX_PATH];
 
 		/* FIXME: this should use the OBS install dir as a base and not rely on the current directory */
-		if (GetFullPathNameW(wpath, MAX_PATH, fullpath, NULL)) {
+		const DWORD length = GetFullPathNameW(wpath, MAX_PATH, fullpath, NULL);
+		if (length && length < MAX_PATH) {
 			h_library = LoadLibraryExW(fullpath, NULL,
 						   LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+		} else if (length >= MAX_PATH) {
+			SetLastError(ERROR_INSUFFICIENT_BUFFER);
 		}
 	} else {
 		h_library = LoadLibraryExW(wpath, NULL, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);

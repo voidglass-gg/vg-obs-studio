@@ -1,7 +1,9 @@
+#include <voidglass-publication.h>
 #include <windows.h>
 #include <psapi.h>
 #include <inttypes.h>
 #include "graphics-hook.h"
+#include "../capture-mapping.h"
 #ifdef OBS_LEGACY
 #include "../graphics-hook-ver.h"
 #include "../../libobs/util/windows/obfuscate.h"
@@ -412,6 +414,7 @@ static inline void capture_loop(void)
 		 * a small sleep interval in case the thread needs to stop */
 		if (n % 100 == 0)
 			attempt_hook();
+		vg_pub_tick();
 		Sleep(40);
 	}
 }
@@ -424,7 +427,9 @@ static DWORD WINAPI main_capture_thread(HANDLE thread_handle)
 		return 0;
 	}
 
+	vg_pub_start();
 	capture_loop();
+	vg_pub_shutdown();
 	return 0;
 }
 
@@ -522,7 +527,7 @@ static inline bool init_shared_info(size_t size, HWND window)
 	wchar_t name[64];
 	HWND top = GetAncestor(window, GA_ROOT);
 
-	swprintf(name, 64, SHMEM_TEXTURE "_%" PRIu64 "_%u", (uint64_t)(uintptr_t)top, ++shmem_id_counter);
+	capture_mapping_name(name, (uint64_t)(uintptr_t)top, ++shmem_id_counter);
 
 	shmem_file_handle = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, (DWORD)size, name);
 	if (!shmem_file_handle) {

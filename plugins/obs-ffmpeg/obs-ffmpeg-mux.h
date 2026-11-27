@@ -62,8 +62,23 @@ struct ffmpeg_muxer {
 	int64_t last_dts_usec;
 
 	bool is_network;
+	bool audio_only;
 	bool split_file;
 	bool allow_overwrite;
+#ifdef _WIN32
+	os_process_args_t *prepared_args;
+	void *file_opened_event;
+	char *file_opened_event_name;
+	struct dstr voidglass_log_context;
+	struct dstr helper_error;
+	pthread_t stderr_thread;
+	bool stderr_thread_started;
+	bool helper_closed_file;
+	pthread_mutex_t observer_mutex;
+	bool exclusive_started;
+	void (*packet_observer)(void *, const struct encoder_packet *);
+	void *packet_observer_data;
+#endif
 };
 
 bool stopping(struct ffmpeg_muxer *stream);

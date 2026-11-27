@@ -1,4 +1,90 @@
 #include "winrt-capture.h"
+#include "owned-close-queue.hpp"
+#include "border-access.hpp"
+
+#include <memory>
+
+/* Only window capture opts in. Read once per capture to allow a process-wide rollback. */
+static bool use_free_threaded_window(HWND window)
+{
+	char value[2]{};
+	return window &&
+	       !(GetEnvironmentVariableA("VG_WGC_FORCE_LEGACY", value, sizeof(value)) == 1 && value[0] == '1');
+}
+
+class capture_graphics_scope {
+	bool entered;
+
+public:
+	explicit capture_graphics_scope(bool enter) : entered(enter)
+	{
+		if (entered)
+			obs_enter_graphics();
+	}
+	~capture_graphics_scope()
+	{
+		if (entered)
+			obs_leave_graphics();
+	}
+};
+
+template<typename T> static void close_capture_resource(T &resource) noexcept
+{
+	/* Clear ownership before Close, including when Close throws. */
+	T owned = std::move(resource);
+	resource = nullptr;
+	if (owned) {
+		try {
+			owned.Close();
+		} catch (...) {
+			blog(LOG_WARNING, "WGC resource Close failed (0x%08X)", winrt::to_hresult().value);
+		}
+	}
+}
+
+using capture_access_operation = decltype(winrt::Windows::Graphics::Capture::GraphicsCaptureAccess::RequestAccessAsync(
+	winrt::Windows::Graphics::Capture::GraphicsCaptureAccessKind::Borderless));
+
+// No frame, revoker, capture pointer, OBS texture or graphics-context operation
+// is allowed in this bundle. It owns only the retired generation's references.
+struct window_close_bundle {
+	winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool pool{nullptr};
+	winrt::Windows::Graphics::Capture::GraphicsCaptureSession session{nullptr};
+	winrt::Windows::Graphics::Capture::GraphicsCaptureItem item{nullptr};
+	winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice device{nullptr};
+	ComPtr<ID3D11DeviceContext> context;
+	ComPtr<IDXGIDevice> dxgi_device;
+	winrt::com_ptr<IInspectable> inspectable;
+	winrt::Windows::Foundation::IActivationFactory factory{nullptr};
+	winrt::com_ptr<IGraphicsCaptureItemInterop> interop;
+	capture_access_operation access{nullptr};
+	window_close_bundle() noexcept = default;
+};
+
+struct window_close_policy {
+	bool Initialize() noexcept
+	{
+		try {
+			winrt::init_apartment(winrt::apartment_type::multi_threaded);
+			return true;
+		} catch (...) {
+			blog(LOG_ERROR, "WGC Close worker MTA initialization failed (0x%08X)", winrt::to_hresult().value);
+			return false;
+		}
+	}
+	void Close(window_close_bundle &value) noexcept
+	{
+		// Match the legacy pool/session teardown order. This order alone is
+		// not a bound on OS RPC; neither call runs on graphics/control.
+		close_capture_resource(value.pool);
+		close_capture_resource(value.session);
+		// The queue clears ALL remaining references on this MTA worker before
+		// returning its reserved slot. Never call Copy/Flush/ClearState here.
+	}
+	void Uninitialize() noexcept { winrt::uninit_apartment(); }
+};
+using window_close_queue = wgc::OwnedCloseQueue<window_close_bundle, window_close_policy, 32>;
+static window_close_queue window_closes;
 
 extern "C" EXPORT BOOL winrt_capture_supported()
 try {
@@ -92,6 +178,36 @@ static DXGI_FORMAT get_pixel_format(HWND window, HMONITOR monitor, BOOL force_sd
 }
 
 struct winrt_capture {
+	/* FreeThreaded has no FrameArrived/Closed handler holding a raw capture pointer.
+	 * All application access, including teardown, is serialized by OBS graphics.
+	 * Poll only on the graphics task thread; taking its lock on another thread
+	 * does not make that thread the capture owner. */
+	bool free_threaded = false;
+	bool polling = false;
+	uint64_t generation = 0;
+	DXGI_FORMAT pool_format = DXGI_FORMAT_UNKNOWN;
+	DWORD window_pid = 0;
+	DWORD window_tid = 0;
+	window_close_queue::Lease close_lease;
+	winrt::Windows::Foundation::IActivationFactory capture_factory{nullptr};
+	winrt::com_ptr<IGraphicsCaptureItemInterop> capture_interop;
+	ComPtr<IDXGIDevice> capture_dxgi_device;
+	winrt::com_ptr<IInspectable> capture_inspectable;
+	wgc::BorderAccess<capture_access_operation> border_access;
+	void request_border_access() noexcept;
+
+	bool start_window_capture(ID3D11Device *d3d_device) noexcept;
+	void poll_frame() noexcept;
+	void close_window_capture() noexcept;
+	bool needs_texture(uint32_t width, uint32_t height, DXGI_FORMAT pixel_format) const;
+	bool copy_texture(ID3D11Texture2D *surface, const D3D11_BOX &box, DXGI_FORMAT pixel_format);
+
+	~winrt_capture()
+	{
+		if (free_threaded)
+			close_window_capture();
+	}
+
 	HWND window;
 	BOOL client_area;
 	BOOL force_sdr;
@@ -195,12 +311,170 @@ struct winrt_capture {
 	}
 };
 
+void winrt_capture::close_window_capture() noexcept
+{
+	active = FALSE;
+	texture_written = false;
+	texture_width = texture_height = 0;
+	++generation;
+	if (close_lease) {
+		window_closes.Retire(close_lease, [&](window_close_bundle &owned) noexcept {
+			owned.pool = std::move(frame_pool);
+			owned.session = std::move(session);
+			owned.item = std::move(item);
+			owned.device = std::move(device);
+			owned.context = std::move(context);
+			owned.dxgi_device = std::move(capture_dxgi_device);
+			owned.inspectable = std::move(capture_inspectable);
+			owned.factory = std::move(capture_factory);
+			owned.interop = std::move(capture_interop);
+			owned.access = border_access.Retire();
+		});
+	} else if (session || frame_pool || context || device || item || capture_factory || capture_interop ||
+		   capture_dxgi_device || capture_inspectable || border_access) {
+		// An internal ownership violation must never release a final WinRT
+		// reference on graphics, nor use bcrash (whose default handler exits0).
+		std::terminate();
+	}
+}
+
+static gs_color_format window_texture_format(DXGI_FORMAT pixel_format)
+{
+	return pixel_format == DXGI_FORMAT_R16G16B16A16_FLOAT ? GS_RGBA16F : GS_BGRA;
+}
+
+bool winrt_capture::needs_texture(uint32_t width, uint32_t height, DXGI_FORMAT pixel_format) const
+{
+	return !texture || width != gs_texture_get_width(texture) || height != gs_texture_get_height(texture) ||
+	       window_texture_format(pixel_format) != gs_texture_get_color_format(texture);
+}
+
+/* If allocation is needed, surface must be owned independently of the WGC pool.
+ * No checked-out frame may cross an OBS texture allocation or a device rebuild. */
+bool winrt_capture::copy_texture(ID3D11Texture2D *surface, const D3D11_BOX &box, DXGI_FORMAT pixel_format)
+{
+	const uint32_t width = box.right - box.left;
+	const uint32_t height = box.bottom - box.top;
+	if (needs_texture(width, height, pixel_format)) {
+		const uint64_t epoch = generation;
+		texture_written = false;
+		texture_width = texture_height = 0;
+		gs_texture_destroy(texture);
+		texture = nullptr;
+		gs_texture_t *replacement =
+			gs_texture_create(width, height, window_texture_format(pixel_format), 1, nullptr, 0);
+		if (generation != epoch || !active) {
+			gs_texture_destroy(replacement);
+			return false;
+		}
+		texture = replacement;
+		if (!texture)
+			winrt::throw_hresult(E_OUTOFMEMORY);
+	}
+	context->CopySubresourceRegion((ID3D11Texture2D *)gs_texture_get_obj(texture), 0, 0, 0, 0, surface, 0, &box);
+	format = pixel_format;
+	texture_width = width;
+	texture_height = height;
+	texture_written = true;
+	return true;
+}
+
+void winrt_capture::poll_frame() noexcept
+{
+	if (!obs_in_task_thread(OBS_TASK_GRAPHICS))
+		return;
+	capture_graphics_scope graphics(true);
+	if (active)
+		border_access.Poll(session);
+	if (!free_threaded || polling || !active || !frame_pool)
+		return;
+	struct polling_scope {
+		bool &flag;
+		explicit polling_scope(bool &value) : flag(value) { flag = true; }
+		~polling_scope() { flag = false; }
+	} poll(polling);
+	try {
+		DWORD pid = 0;
+		const DWORD tid = GetWindowThreadProcessId(window, &pid);
+		if (!tid || pid != window_pid || tid != window_tid) {
+			close_window_capture();
+			return;
+		}
+		struct scoped_frame {
+			winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame value{nullptr};
+			~scoped_frame() { close_capture_resource(value); }
+		} frame{frame_pool.TryGetNextFrame()};
+		if (!frame.value)
+			return;
+		const auto size = frame.value.ContentSize();
+		if (size.Width <= 0 || size.Height <= 0)
+			return;
+		const DXGI_FORMAT requested_format = get_pixel_format(window, nullptr, force_sdr);
+		/* A transition frame can still have the old pool allocation. Do not copy
+		 * undefined pixels on shrink, or crop an old allocation as the new size. */
+		if (size.Width != last_size.Width || size.Height != last_size.Height ||
+		    requested_format != pool_format) {
+			close_capture_resource(frame.value);
+			frame_pool.Recreate(
+				device,
+				static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(requested_format), 2,
+				size);
+			last_size = size;
+			pool_format = requested_format;
+			return;
+		}
+		auto surface = GetDXGIInterfaceFromObject<ID3D11Texture2D>(frame.value.Surface());
+		D3D11_TEXTURE2D_DESC desc{};
+		surface->GetDesc(&desc);
+		if (desc.Format != pool_format)
+			winrt::throw_hresult(E_UNEXPECTED);
+		/* ContentSize bounds valid pixels; GetDesc bounds allocated pixels. */
+		const uint32_t width = std::min(desc.Width, (uint32_t)size.Width);
+		const uint32_t height = std::min(desc.Height, (uint32_t)size.Height);
+		D3D11_BOX box{0, 0, 0, width, height, 1};
+		if (client_area && !get_client_box(window, width, height, &box))
+			return;
+		if (!width || !height)
+			return;
+		if (needs_texture(box.right - box.left, box.bottom - box.top, desc.Format)) {
+			/* Keep the first usable frame, but return its borrowed surface before
+			 * calling the OBS allocator. This temporary exists only on transitions. */
+			D3D11_TEXTURE2D_DESC owned_desc{};
+			owned_desc.Width = box.right - box.left;
+			owned_desc.Height = box.bottom - box.top;
+			owned_desc.MipLevels = owned_desc.ArraySize = owned_desc.SampleDesc.Count = 1;
+			owned_desc.Format = desc.Format;
+			owned_desc.Usage = D3D11_USAGE_DEFAULT;
+			ComPtr<ID3D11Device> d3d_device;
+			surface->GetDevice(&d3d_device);
+			winrt::com_ptr<ID3D11Texture2D> owned;
+			winrt::check_hresult(d3d_device->CreateTexture2D(&owned_desc, nullptr, owned.put()));
+			context->CopySubresourceRegion(owned.get(), 0, 0, 0, 0, surface.get(), 0, &box);
+			surface = nullptr;
+			close_capture_resource(frame.value);
+			box = {0, 0, 0, owned_desc.Width, owned_desc.Height, 1};
+			copy_texture(owned.get(), box, desc.Format);
+		} else {
+			copy_texture(surface.get(), box, desc.Format);
+		}
+	} catch (...) {
+		blog(LOG_WARNING, "WGC window frame failed (0x%08X)", winrt::to_hresult().value);
+		close_window_capture();
+	}
+}
+
 static struct winrt_capture *capture_list;
 
 static void winrt_capture_device_loss_release(void *data)
 {
 	winrt_capture *capture = static_cast<winrt_capture *>(data);
+	if (capture->free_threaded) {
+		capture_graphics_scope graphics(true);
+		capture->close_window_capture();
+		return;
+	}
 	capture->active = FALSE;
+	capture->border_access.Retire();
 
 	capture->frame_arrived.revoke();
 
@@ -242,6 +516,15 @@ try {
 	return false;
 }
 
+void winrt_capture::request_border_access() noexcept
+{
+	if (winrt_capture_border_toggle_supported())
+		border_access.Begin([] {
+			return winrt::Windows::Graphics::Capture::GraphicsCaptureAccess::RequestAccessAsync(
+				winrt::Windows::Graphics::Capture::GraphicsCaptureAccessKind::Borderless);
+		});
+}
+
 static winrt::Windows::Graphics::Capture::GraphicsCaptureItem
 winrt_capture_create_item(IGraphicsCaptureItemInterop *const interop_factory, HWND window, HMONITOR monitor)
 {
@@ -281,9 +564,62 @@ winrt_capture_create_item(IGraphicsCaptureItemInterop *const interop_factory, HW
 	return item;
 }
 
+bool winrt_capture::start_window_capture(ID3D11Device *d3d_device) noexcept
+{
+	close_window_capture();
+	try {
+		DWORD pid = 0;
+		const DWORD tid = GetWindowThreadProcessId(window, &pid);
+		if (!tid || tid != window_tid || pid != window_pid)
+			return false;
+		close_lease = window_closes.Reserve();
+		if (!close_lease) {
+			const auto pending = window_closes.Snapshot();
+			blog(LOG_WARNING, "WGC Window capture unavailable: Close capacity exhausted or worker unavailable (live=%zu pending=%zu closing=%zu, capacity=32)",
+			     pending.live, pending.pending, pending.closing);
+			return false;
+		}
+		// Reserve before the first WinRT object. Store partial references in
+		// the capture so catch can transfer them; no sole local reference is
+		// released on graphics when a later creation step throws.
+		capture_factory = winrt::get_activation_factory<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>();
+		capture_interop = capture_factory.as<IGraphicsCaptureItemInterop>();
+		winrt::check_hresult(capture_interop->CreateForWindow(
+			window, winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+			reinterpret_cast<void **>(winrt::put_abi(item))));
+		winrt::check_hresult(d3d_device->QueryInterface(&capture_dxgi_device));
+		winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(capture_dxgi_device.Get(), capture_inspectable.put()));
+		device = capture_inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+		d3d_device->GetImmediateContext(&context);
+		last_size = item.Size();
+		if (last_size.Width <= 0 || last_size.Height <= 0)
+			winrt::throw_hresult(E_INVALIDARG);
+		pool_format = get_pixel_format(window, nullptr, force_sdr);
+		frame_pool = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
+			device, static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(pool_format), 2,
+			last_size);
+		session = frame_pool.CreateCaptureSession(item);
+		if (capture_cursor)
+			session.IsCursorCaptureEnabled(cursor_visible);
+		session.StartCapture();
+		active = TRUE;
+		request_border_access();
+		return true;
+	} catch (...) {
+		blog(LOG_WARNING, "WGC window start/rebuild failed (0x%08X)", winrt::to_hresult().value);
+		close_window_capture();
+		return false;
+	}
+}
+
 static void winrt_capture_device_loss_rebuild(void *device_void, void *data)
 {
 	winrt_capture *capture = static_cast<winrt_capture *>(data);
+	if (capture->free_threaded) {
+		capture_graphics_scope graphics(true);
+		capture->start_window_capture((ID3D11Device *)device_void);
+		return;
+	}
 
 	auto activation_factory =
 		winrt::get_activation_factory<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>();
@@ -313,13 +649,6 @@ static void winrt_capture_device_loss_rebuild(void *device_void, void *data)
 			capture->last_size);
 	const winrt::Windows::Graphics::Capture::GraphicsCaptureSession session = frame_pool.CreateCaptureSession(item);
 
-	if (winrt_capture_border_toggle_supported()) {
-		winrt::Windows::Graphics::Capture::GraphicsCaptureAccess::RequestAccessAsync(
-			winrt::Windows::Graphics::Capture::GraphicsCaptureAccessKind::Borderless)
-			.get();
-		session.IsBorderRequired(false);
-	}
-
 	if (winrt_capture_cursor_toggle_supported()) {
 		session.IsCursorCaptureEnabled(capture->capture_cursor && capture->cursor_visible);
 	}
@@ -335,6 +664,7 @@ static void winrt_capture_device_loss_rebuild(void *device_void, void *data)
 	try {
 		session.StartCapture();
 		capture->active = TRUE;
+		capture->request_border_access();
 	} catch (winrt::hresult_error &err) {
 		blog(LOG_ERROR, "StartCapture (0x%08X): %s", err.code().value, winrt::to_string(err.message()).c_str());
 	} catch (...) {
@@ -345,6 +675,25 @@ static void winrt_capture_device_loss_rebuild(void *device_void, void *data)
 static struct winrt_capture *winrt_capture_init_internal(BOOL cursor, HWND window, BOOL client_area, BOOL force_sdr,
 							 HMONITOR monitor)
 try {
+	if (use_free_threaded_window(window)) {
+		capture_graphics_scope graphics(true);
+		auto capture = std::make_unique<winrt_capture>();
+		capture->free_threaded = true;
+		capture->window = window;
+		capture->window_tid = GetWindowThreadProcessId(window, &capture->window_pid);
+		capture->client_area = client_area;
+		capture->force_sdr = force_sdr;
+		capture->capture_cursor = winrt_capture_cursor_toggle_supported();
+		capture->cursor_visible = cursor;
+		if (!capture->start_window_capture((ID3D11Device *)gs_get_device_obj()))
+			return nullptr;
+		gs_device_loss callbacks{winrt_capture_device_loss_release, winrt_capture_device_loss_rebuild,
+					 capture.get()};
+		gs_register_loss_callbacks(&callbacks);
+		capture->next = capture_list;
+		capture_list = capture.get();
+		return capture.release();
+	}
 	ID3D11Device *const d3d_device = (ID3D11Device *)gs_get_device_obj();
 	ComPtr<IDXGIDevice> dxgi_device;
 
@@ -379,13 +728,6 @@ try {
 			device, static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(format), 2, size);
 	const winrt::Windows::Graphics::Capture::GraphicsCaptureSession session = frame_pool.CreateCaptureSession(item);
 
-	if (winrt_capture_border_toggle_supported()) {
-		winrt::Windows::Graphics::Capture::GraphicsCaptureAccess::RequestAccessAsync(
-			winrt::Windows::Graphics::Capture::GraphicsCaptureAccessKind::Borderless)
-			.get();
-		session.IsBorderRequired(false);
-	}
-
 	/* disable cursor capture if possible since ours performs better */
 	const BOOL cursor_toggle_supported = winrt_capture_cursor_toggle_supported();
 	if (cursor_toggle_supported) {
@@ -414,6 +756,7 @@ try {
 
 	session.StartCapture();
 	capture->active = TRUE;
+	capture->request_border_access();
 
 	gs_device_loss callbacks;
 	callbacks.device_loss_release = winrt_capture_device_loss_release;
@@ -445,6 +788,7 @@ extern "C" EXPORT struct winrt_capture *winrt_capture_init_monitor(BOOL cursor, 
 extern "C" EXPORT void winrt_capture_free(struct winrt_capture *capture)
 {
 	if (capture) {
+		capture_graphics_scope graphics(capture->free_threaded);
 		struct winrt_capture *current = capture_list;
 		if (current == capture) {
 			capture_list = capture->next;
@@ -463,6 +807,11 @@ extern "C" EXPORT void winrt_capture_free(struct winrt_capture *capture)
 		gs_texture_destroy(capture->texture);
 		obs_leave_graphics();
 
+		if (capture->free_threaded) {
+			capture->close_window_capture();
+			delete capture;
+			return;
+		}
 		capture->frame_arrived.revoke();
 		capture->closed.revoke();
 
@@ -494,11 +843,14 @@ extern "C" EXPORT void winrt_capture_free(struct winrt_capture *capture)
 
 extern "C" EXPORT BOOL winrt_capture_active(const struct winrt_capture *capture)
 {
+	capture_graphics_scope graphics(capture->free_threaded);
+	const_cast<winrt_capture *>(capture)->poll_frame();
 	return capture->active;
 }
 
 extern "C" EXPORT BOOL winrt_capture_show_cursor(struct winrt_capture *capture, BOOL visible)
 {
+	capture_graphics_scope graphics(capture->free_threaded);
 	BOOL success = FALSE;
 
 	try {
@@ -522,11 +874,15 @@ extern "C" EXPORT BOOL winrt_capture_show_cursor(struct winrt_capture *capture, 
 
 extern "C" EXPORT enum gs_color_space winrt_capture_get_color_space(const struct winrt_capture *capture)
 {
+	capture_graphics_scope graphics(capture->free_threaded);
+	const_cast<winrt_capture *>(capture)->poll_frame();
 	return (capture->format == DXGI_FORMAT_R16G16B16A16_FLOAT) ? GS_CS_709_EXTENDED : GS_CS_SRGB;
 }
 
 extern "C" EXPORT void winrt_capture_render(struct winrt_capture *capture)
 {
+	capture_graphics_scope graphics(capture->free_threaded);
+	capture->poll_frame();
 	if (capture->texture_written) {
 		const char *tech_name = "Draw";
 		float multiplier = 1.f;
@@ -578,16 +934,24 @@ extern "C" EXPORT void winrt_capture_render(struct winrt_capture *capture)
 
 extern "C" EXPORT uint32_t winrt_capture_width(const struct winrt_capture *capture)
 {
+	capture_graphics_scope graphics(capture && capture->free_threaded);
+	if (capture)
+		const_cast<winrt_capture *>(capture)->poll_frame();
 	return capture ? capture->texture_width : 0;
 }
 
 extern "C" EXPORT uint32_t winrt_capture_height(const struct winrt_capture *capture)
 {
+	capture_graphics_scope graphics(capture && capture->free_threaded);
+	if (capture)
+		const_cast<winrt_capture *>(capture)->poll_frame();
 	return capture ? capture->texture_height : 0;
 }
 
 extern "C" EXPORT void winrt_capture_thread_start()
 {
+	if (!window_closes.Start())
+		blog(LOG_ERROR, "WGC Close worker unavailable; new FreeThreaded Window captures will be refused");
 	struct winrt_capture *capture = capture_list;
 	void *const device = gs_get_device_obj();
 	while (capture) {
@@ -603,4 +967,14 @@ extern "C" EXPORT void winrt_capture_thread_stop()
 		winrt_capture_device_loss_release(capture);
 		capture = capture->next;
 	}
+	// obs-video invokes this OUTSIDE graphics, before dispatcher/COM teardown
+	// and before closing its module handle. Every retired generation and its
+	// final Release must finish before the worker can uninitialize or unload.
+	const bool within_warning_threshold = window_closes.StopAndJoin(std::chrono::seconds(5), [] {
+		const auto pending = window_closes.Snapshot();
+		blog(LOG_WARNING, "WGC Close drain INCOMPLETE: still waiting for owned drain after5000ms (live=%zu pending=%zu closing=%zu); retaining join and module lifetime",
+		     pending.live, pending.pending, pending.closing);
+	});
+	if (!within_warning_threshold)
+		blog(LOG_INFO, "WGC Close drain completed; worker joined after warning threshold");
 }

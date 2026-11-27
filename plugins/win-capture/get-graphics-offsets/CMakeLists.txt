@@ -9,6 +9,7 @@ if(NOT TARGET OBS::hook-config)
 endif()
 
 add_executable(get-graphics-offsets)
+target_include_directories(get-graphics-offsets PRIVATE "${CMAKE_SOURCE_DIR}/libobs")
 target_sources(
   get-graphics-offsets
   PRIVATE d3d8-offsets.cpp d3d9-offsets.cpp dxgi-offsets.cpp get-graphics-offsets.c get-graphics-offsets.h

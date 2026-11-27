@@ -102,6 +102,8 @@ os_process_pipe_t *os_process_pipe_create(const char *cmd_line, const char *type
 	}
 
 	if (!create_pipe(&err_input, &err_output)) {
+		CloseHandle(output);
+		CloseHandle(input);
 		return NULL;
 	}
 
@@ -134,6 +136,8 @@ os_process_pipe_t *os_process_pipe_create(const char *cmd_line, const char *type
 	return pp;
 
 error:
+	CloseHandle(err_output);
+	CloseHandle(err_input);
 	CloseHandle(output);
 	CloseHandle(input);
 	return NULL;
@@ -145,7 +149,7 @@ static inline void add_backslashes(struct dstr *str, size_t count)
 		dstr_cat_ch(str, '\\');
 }
 
-os_process_pipe_t *os_process_pipe_create2(const os_process_args_t *args, const char *type)
+static struct dstr windows_command_line(const os_process_args_t *args)
 {
 	struct dstr cmd_line = {0};
 
@@ -193,10 +197,34 @@ os_process_pipe_t *os_process_pipe_create2(const os_process_args_t *args, const 
 		argv++;
 	}
 
+	return cmd_line;
+}
+
+size_t os_process_args_windows_command_line_size(const os_process_args_t *args)
+{
+	struct dstr cmd_line = windows_command_line(args);
+	const size_t units = os_utf8_to_wcs(cmd_line.array, 0, NULL, 0);
+	dstr_free(&cmd_line);
+	return units ? units + 1 : 0;
+}
+
+os_process_pipe_t *os_process_pipe_create2(const os_process_args_t *args, const char *type)
+{
+	struct dstr cmd_line = windows_command_line(args);
 	os_process_pipe_t *ret = os_process_pipe_create(cmd_line.array, type);
 
 	dstr_free(&cmd_line);
 	return ret;
+}
+
+bool os_process_pipe_close_input(os_process_pipe_t *pp)
+{
+	if (!pp || pp->read_pipe)
+		return false;
+
+	HANDLE input = pp->handle;
+	pp->handle = NULL;
+	return !input || CloseHandle(input);
 }
 
 int os_process_pipe_destroy(os_process_pipe_t *pp)
@@ -206,12 +234,14 @@ int os_process_pipe_destroy(os_process_pipe_t *pp)
 	if (pp) {
 		DWORD code;
 
-		CloseHandle(pp->handle);
+		if (pp->handle)
+			CloseHandle(pp->handle);
 		CloseHandle(pp->handle_err);
 
-		WaitForSingleObject(pp->process, INFINITE);
-		if (GetExitCodeProcess(pp->process, &code))
+		if (WaitForSingleObject(pp->process, INFINITE) == WAIT_OBJECT_0 && GetExitCodeProcess(pp->process, &code))
 			ret = (int)code;
+		else
+			ret = -1;
 
 		CloseHandle(pp->process);
 		bfree(pp);

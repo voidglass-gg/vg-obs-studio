@@ -90,6 +90,7 @@ struct window_capture {
 	bool force_sdr;
 	bool hooked;
 	bool capture_audio;
+	bool strict_match;
 
 	struct dc_capture capture;
 
@@ -219,6 +220,7 @@ static void update_settings(struct window_capture *wc, obs_data_t *s)
 
 	wc->method = choose_method(method, wgc_supported, wc->class);
 	wc->priority = (enum window_priority)priority;
+	wc->strict_match = obs_data_get_bool(s, "strict_match");
 	wc->cursor = obs_data_get_bool(s, "cursor");
 	wc->capture_audio = obs_data_get_bool(s, "capture_audio");
 	wc->force_sdr = obs_data_get_bool(s, "force_sdr");
@@ -595,6 +597,14 @@ static void wc_tick(void *data, float seconds)
 	if (!obs_source_showing(wc->source))
 		return;
 
+	const bool strict = wc->method == METHOD_WGC && wc->strict_match;
+	if (strict && wc->window &&
+	    (!IsWindowVisible(wc->window) || IsIconic(wc->window) ||
+	     !ms_window_matches(wc->window, wc->class, wc->title, wc->executable))) {
+		wc_hide(wc);
+		force_reset(wc);
+	}
+
 	if (!wc->window || !IsWindow(wc->window)) {
 		if (wc->hooked) {
 			wc->hooked = false;
@@ -606,7 +616,7 @@ static void wc_tick(void *data, float seconds)
 			calldata_free(&data);
 		}
 
-		if (!wc->title && !wc->class) {
+		if (strict ? !wc->executable : (!wc->title && !wc->class)) {
 			if (wc->capture.valid)
 				dc_capture_free(&wc->capture);
 			return;
@@ -627,10 +637,12 @@ static void wc_tick(void *data, float seconds)
 
 		wc->check_window_timer = 0.0f;
 
-		wc->window = (wc->method == METHOD_WGC) ? ms_find_window_top_level(INCLUDE_MINIMIZED, wc->priority,
-										   wc->class, wc->title, wc->executable)
-							: ms_find_window(INCLUDE_MINIMIZED, wc->priority, wc->class,
-									 wc->title, wc->executable);
+		if (wc->method == METHOD_WGC)
+			wc->window = ms_find_window_top_level(strict ? EXCLUDE_MINIMIZED : INCLUDE_MINIMIZED,
+							      strict ? WINDOW_PRIORITY_EXACT : wc->priority, wc->class,
+							      wc->title, wc->executable);
+		else
+			wc->window = ms_find_window(INCLUDE_MINIMIZED, wc->priority, wc->class, wc->title, wc->executable);
 		if (!wc->window) {
 			if (wc->capture.valid)
 				dc_capture_free(&wc->capture);

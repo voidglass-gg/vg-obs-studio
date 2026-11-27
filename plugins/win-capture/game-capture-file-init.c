@@ -4,11 +4,23 @@
 #include <aclapi.h>
 #include <sddl.h>
 #include <obs-module.h>
+#include <util/windows/voidglass-dll-security.h>
 #include <util/windows/win-version.h>
 #include <util/platform.h>
 #include <util/c99defs.h>
 #include <util/base.h>
 
+#ifdef VOIDGLASS_RUNTIME_HOOKS
+char *get_hook_path(bool b64)
+{
+	return obs_module_file(b64 ? "graphics-hook64.dll" : "graphics-hook32.dll");
+}
+
+void init_hook_files(void)
+{
+	blog(LOG_INFO, "[win-capture] VoidGlass runtime Hook policy; automatic Vulkan deployment disabled");
+}
+#else
 /* ------------------------------------------------------------------------- */
 /* helper funcs                                                              */
 
@@ -176,20 +188,18 @@ static bool update_hook_file(bool b64)
 	wchar_t src_json[MAX_PATH];
 	wchar_t dst_json[MAX_PATH];
 
-	StringCbCopyW(temp, sizeof(temp),
-		      L"..\\..\\data\\obs-plugins\\"
-		      L"win-capture\\");
-	make_filename(temp, L"obs-vulkan", L".json");
-
-	if (_wfullpath(src_json, temp, MAX_PATH) == NULL)
-		return false;
-
-	StringCbCopyW(temp, sizeof(temp),
-		      L"..\\..\\data\\obs-plugins\\"
-		      L"win-capture\\");
-	make_filename(temp, L"graphics-hook", L".dll");
-
-	if (_wfullpath(src, temp, MAX_PATH) == NULL)
+	char *module_dll = obs_module_file(b64 ? "graphics-hook64.dll" : "graphics-hook32.dll");
+	char *module_json = obs_module_file(b64 ? "obs-vulkan64.json" : "obs-vulkan32.json");
+	wchar_t *dll = NULL, *json = NULL;
+	bool source_ok = module_dll && module_json && os_utf8_to_wcs_ptr(module_dll, 0, &dll) &&
+			 os_utf8_to_wcs_ptr(module_json, 0, &json) && vg_dll_absolute(dll) && vg_dll_absolute(json) &&
+			 SUCCEEDED(StringCbCopyW(src, sizeof(src), dll)) &&
+			 SUCCEEDED(StringCbCopyW(src_json, sizeof(src_json), json));
+	bfree(module_dll);
+	bfree(module_json);
+	bfree(dll);
+	bfree(json);
+	if (!source_ok)
 		return false;
 
 	get_programdata_path(temp, L"obs-studio-hook\\");
@@ -319,3 +329,5 @@ void init_hook_files()
 		init_vulkan_registry(false);
 	}
 }
+
+#endif /* VOIDGLASS_RUNTIME_HOOKS */

@@ -427,7 +427,8 @@ EXPORT profiler_name_store_t *obs_get_profiler_name_store(void);
  *       OBS context.
  *
  * @param   ovi  Pointer to an obs_video_info structure containing the
- *               specification of the graphics subsystem,
+ *               specification of the graphics subsystem, or NULL to stop
+ *               video and release the graphics subsystem.
  * @return       OBS_VIDEO_SUCCESS if successful
  *               OBS_VIDEO_NOT_SUPPORTED if the adapter lacks capabilities
  *               OBS_VIDEO_INVALID_PARAM if a parameter is invalid

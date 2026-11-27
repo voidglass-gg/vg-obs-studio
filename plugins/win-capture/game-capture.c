@@ -1,3 +1,8 @@
+#include "voidglass-injector.h"
+#include <voidglass-publication.h>
+#include <tlhelp32.h>
+#include "voidglass-module-files.h"
+#include "voidglass-provenance-cache.h"
 #include <inttypes.h>
 #include <obs-module.h>
 #include <obs-hotkey.h>
@@ -15,6 +20,7 @@
 #include "compat-helpers.h"
 #include "graphics-hook-info.h"
 #include "graphics-hook-ver.h"
+#include "capture-mapping.h"
 #include "cursor-capture.h"
 #include "app-helpers.h"
 #include "audio-helpers.h"
@@ -123,7 +129,8 @@ struct game_capture {
 	obs_source_t *audio_source;
 
 	struct cursor_data cursor_data;
-	HANDLE injector_process;
+	uint64_t injector_lease;
+	uint64_t injector_creation;
 	uint32_t cx;
 	uint32_t cy;
 	uint32_t pitch;
@@ -173,6 +180,13 @@ struct game_capture {
 	HANDLE hook_data_map;
 	HANDLE global_hook_info_map;
 	HANDLE target_process;
+	HANDLE publication_map;
+	const vg_pub_shared *publication_view;
+	uint64_t publication_instance, publication_heartbeat;
+	struct vg_provenance_cache publication_provenance;
+	vg_dll_file *publication_reference;
+	char *publication_hook_path;
+	char publication_hook_sha256[65];
 	HANDLE texture_mutexes[2];
 	wchar_t *app_sid;
 	int retrying;
@@ -309,8 +323,47 @@ static inline float hook_rate_to_float(enum hook_rate rate)
 	}
 }
 
-static void stop_capture(struct game_capture *gc)
+static void game_capture_clear_publication_proof(struct game_capture *gc)
 {
+	gc->publication_instance = gc->publication_heartbeat = 0;
+	bfree(gc->publication_hook_path);
+	gc->publication_hook_path = NULL;
+	gc->publication_hook_sha256[0] = 0;
+}
+
+static void game_capture_reset_publication(struct game_capture *gc)
+{
+	if (gc->publication_view) {
+		UnmapViewOfFile(gc->publication_view);
+		gc->publication_view = NULL;
+	}
+	close_handle(&gc->publication_map);
+	game_capture_clear_publication_proof(gc);
+	if (gc->publication_reference) {
+		vg_dll_close(gc->publication_reference);
+		bfree(gc->publication_reference);
+		gc->publication_reference = NULL;
+	}
+	memset(&gc->publication_provenance, 0, sizeof(gc->publication_provenance));
+}
+
+static void release_injector(struct game_capture *gc)
+{
+	if (gc->injector_lease) {
+		struct vg_injector_status status = vg_injector_get_status(gc->injector_lease);
+		if (status.helper_pid)
+			info("releasing helper request: target=%lu helper=%lu compatibility=%d",
+			     (unsigned long)status.target_pid, (unsigned long)status.helper_pid, status.compatibility);
+		vg_injector_release(gc->injector_lease);
+		gc->injector_lease = gc->injector_creation = 0;
+	}
+}
+
+static void stop_capture(struct game_capture *gc, bool terminal)
+{
+	if (terminal)
+		release_injector(gc);
+	game_capture_reset_publication(gc);
 	ipc_pipe_server_free(&gc->pipe);
 
 	if (gc->hook_stop) {
@@ -387,7 +440,7 @@ static inline void free_config(struct game_capture_config *config)
 static void game_capture_destroy(void *data)
 {
 	struct game_capture *gc = data;
-	stop_capture(gc);
+	stop_capture(gc, true);
 
 	if (gc->audio_source)
 		destroy_audio_source(gc->source, &gc->audio_source);
@@ -530,6 +583,145 @@ static void game_capture_get_hooked(void *data, calldata_t *cd)
 	}
 }
 
+/* Best-effort file provenance, NOT an attestation of a potentially hostile process.
+ * Serialize this procedure with tick/destruction on the OBS graphics thread. */
+static bool game_capture_prepare_hook_reference(void *data)
+{
+	struct game_capture *gc = data;
+	char *path = obs_module_file("graphics-hook64.dll");
+	if (gc->publication_reference) {
+		vg_dll_close(gc->publication_reference);
+		bfree(gc->publication_reference);
+	}
+	gc->publication_reference = bzalloc(sizeof(*gc->publication_reference));
+	const bool valid = gc->publication_reference &&
+			   vg_module_open(path, IMAGE_FILE_MACHINE_AMD64, true, gc->publication_reference);
+	bfree(path);
+	return valid;
+}
+
+static int game_capture_observe_hook(void *data)
+{
+	struct game_capture *gc = data;
+	game_capture_clear_publication_proof(gc);
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, gc->process_id);
+	int result = VG_HOOK_UNKNOWN, found = 0;
+	if (snapshot == INVALID_HANDLE_VALUE)
+		return result;
+	MODULEENTRY32W entry = {0};
+	entry.dwSize = sizeof(entry);
+	if (Module32FirstW(snapshot, &entry))
+		do {
+			if (_wcsicmp(entry.szModule, L"graphics-hook64.dll"))
+				continue;
+			++found;
+			result = vg_provenance_file(gc->publication_reference, entry.szExePath);
+			bfree(gc->publication_hook_path);
+			gc->publication_hook_path = NULL;
+			os_wcs_to_utf8_ptr(entry.szExePath, 0, &gc->publication_hook_path);
+		} while (Module32NextW(snapshot, &entry));
+	if (GetLastError() != ERROR_NO_MORE_FILES || found != 1)
+		result = VG_HOOK_UNKNOWN;
+	CloseHandle(snapshot);
+	if (result == VG_HOOK_RUNTIME)
+		vg_dll_hex(gc->publication_reference->sha256, gc->publication_hook_sha256);
+	return result;
+}
+
+static void game_capture_get_publication(void *data, calldata_t *cd)
+{
+	struct game_capture *gc = data;
+	int status = VG_PUB_UNAVAILABLE, provenance = VG_HOOK_UNKNOWN;
+	vg_pub_payload value = {0};
+	uint64_t creation = 0;
+	if (!gc)
+		goto done;
+	if (!gc->target_process || WaitForSingleObject(gc->target_process, 0) != WAIT_TIMEOUT ||
+	    GetProcessId(gc->target_process) != gc->process_id || !(creation = vg_pub_creation(gc->target_process))) {
+		game_capture_reset_publication(gc);
+		goto done;
+	}
+	if (!gc->process_is_64bit) {
+		game_capture_reset_publication(gc);
+		status = VG_PUB_ABSENT;
+		goto done;
+	}
+	struct vg_provenance_key key = {
+		.pid = gc->process_id,
+		.creation = creation,
+		.process = (uintptr_t)gc->target_process,
+		.window = (uintptr_t)gc->window,
+		.map_id = gc->global_hook_info ? gc->global_hook_info->map_id : 0,
+		.capturing = gc->capturing,
+	};
+	if (vg_provenance_target_changed(&gc->publication_provenance, &key))
+		game_capture_reset_publication(gc);
+	status = vg_pub_open_reader(gc->process_id, creation, &gc->publication_map, &gc->publication_view);
+	key.channel = gc->publication_view != NULL;
+	if (vg_provenance_select(&gc->publication_provenance, &key))
+		game_capture_clear_publication_proof(gc);
+	provenance = vg_provenance_poll(&gc->publication_provenance, GetTickCount64(), gc,
+					game_capture_prepare_hook_reference, game_capture_observe_hook);
+	if (status != VG_PUB_VALID)
+		goto done;
+	status = vg_pub_read(gc->publication_view, sizeof(vg_pub_shared), &value);
+	if (status != VG_PUB_VALID)
+		goto done;
+	LARGE_INTEGER frequency;
+	QueryPerformanceFrequency(&frequency);
+	if (provenance != VG_HOOK_RUNTIME || value.pid != gc->process_id || value.creation != creation ||
+	    !value.instance || value.frequency != (uint64_t)frequency.QuadPart || !value.heartbeat_qpc ||
+	    (value.native_initialized && (value.api != 11 || value.transport != 1 || !gc->capturing ||
+					  !gc->global_hook_info || value.map_id != gc->global_hook_info->map_id))) {
+		status = VG_PUB_UNAVAILABLE;
+		goto done;
+	}
+	if (gc->publication_instance != value.instance) {
+		gc->publication_instance = value.instance;
+		gc->publication_heartbeat = value.heartbeat_qpc;
+		status = VG_PUB_UNAVAILABLE;
+		goto done;
+	}
+	const uint64_t now = vg_pub_qpc();
+	if (value.heartbeat_qpc <= gc->publication_heartbeat || now < value.heartbeat_qpc ||
+	    now - value.heartbeat_qpc > value.frequency * 2) {
+		status = VG_PUB_UNAVAILABLE;
+		goto done;
+	}
+done:
+	calldata_set_int(cd, "status", status);
+	calldata_set_int(cd, "hook_provenance", provenance);
+	calldata_set_bool(cd, "connected", gc && gc->capturing);
+	calldata_set_string(cd, "hook_path", gc && gc->publication_hook_path ? gc->publication_hook_path : "");
+	calldata_set_string(cd, "hook_sha256", gc ? gc->publication_hook_sha256 : "");
+	calldata_set_bool(cd, "publication_supported", status == VG_PUB_VALID && value.capability == VG_CAP_SUPPORTED);
+	if (status != VG_PUB_VALID)
+		calldata_set_int(cd, "capability", gc && !gc->process_is_64bit ? VG_CAP_UNSUPPORTED : VG_CAP_PENDING);
+	if (status != VG_PUB_VALID)
+		return;
+#define VG_PUB_FIELD(name) calldata_set_int(cd, #name, (long long)value.name)
+	VG_PUB_FIELD(capability);
+	VG_PUB_FIELD(pid);
+	VG_PUB_FIELD(creation);
+	VG_PUB_FIELD(instance);
+	VG_PUB_FIELD(generation);
+	VG_PUB_FIELD(hwnd);
+	VG_PUB_FIELD(map_id);
+	VG_PUB_FIELD(dxgi_installed);
+	VG_PUB_FIELD(native_initialized);
+	VG_PUB_FIELD(submitted);
+	VG_PUB_FIELD(completed);
+	VG_PUB_FIELD(heartbeat_qpc);
+	VG_PUB_FIELD(frequency);
+	VG_PUB_FIELD(initialized_qpc);
+	VG_PUB_FIELD(first_submitted_qpc);
+	VG_PUB_FIELD(first_completed_qpc);
+	VG_PUB_FIELD(last_completed_qpc);
+	VG_PUB_FIELD(device_flags);
+	VG_PUB_FIELD(error);
+#undef VG_PUB_FIELD
+}
+
 static void game_capture_update(void *data, obs_data_t *settings)
 {
 	struct game_capture *gc = data;
@@ -567,7 +759,7 @@ static void game_capture_update(void *data, obs_data_t *settings)
 
 	if (!gc->initial_config) {
 		if (reset_capture) {
-			stop_capture(gc);
+			stop_capture(gc, true);
 		}
 	} else {
 		gc->initial_config = false;
@@ -613,6 +805,7 @@ static void *game_capture_create(obs_data_t *settings, obs_source_t *source)
 	signal_handler_add(sh, "void hooked(ptr source, string title, string class, string executable)");
 
 	proc_handler_t *ph = obs_source_get_proc_handler(source);
+	proc_handler_add(ph, "void get_capture_publication(out int status)", game_capture_get_publication, gc);
 	proc_handler_add(ph,
 			 "void get_hooked(out bool hooked, out string title, out string class, out string executable)",
 			 game_capture_get_hooked, gc);
@@ -628,42 +821,6 @@ static void *game_capture_create(obs_data_t *settings, obs_source_t *source)
 	"that the OBS installation folder is excluded/ignored in the "      \
 	"settings of the security software you are using."
 
-static bool check_file_integrity(struct game_capture *gc, const char *file, const char *name)
-{
-	DWORD error;
-	HANDLE handle;
-	wchar_t *w_file = NULL;
-
-	if (!file || !*file) {
-		warn("Game capture %s not found." STOP_BEING_BAD, name);
-		return false;
-	}
-
-	if (!os_utf8_to_wcs_ptr(file, 0, &w_file)) {
-		warn("Could not convert file name to wide string");
-		return false;
-	}
-
-	handle = CreateFileW(w_file, GENERIC_READ | GENERIC_EXECUTE, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-
-	bfree(w_file);
-
-	if (handle != INVALID_HANDLE_VALUE) {
-		CloseHandle(handle);
-		return true;
-	}
-
-	error = GetLastError();
-	if (error == ERROR_FILE_NOT_FOUND) {
-		warn("Game capture file '%s' not found." STOP_BEING_BAD, file);
-	} else if (error == ERROR_ACCESS_DENIED) {
-		warn("Game capture file '%s' could not be loaded." STOP_BEING_BAD, file);
-	} else {
-		warn("Game capture file '%s' could not be loaded: %lu." STOP_BEING_BAD, file, error);
-	}
-
-	return false;
-}
 
 static inline bool is_64bit_windows(void)
 {
@@ -876,78 +1033,122 @@ static inline bool hook_direct(struct game_capture *gc, const char *hook_path_re
 	return true;
 }
 
-static inline bool create_inject_process(struct game_capture *gc, const char *inject_path, const char *hook_dll)
+/* Already canonicalized and held open by inject_hook until CreateProcess returns. */
+struct inject_launch_context {
+	struct game_capture *gc;
+	const wchar_t *helper, *hook;
+	bool compatibility;
+};
+
+static struct vg_injector_child launch_inject_process(void *data)
 {
-	wchar_t *command_line_w = malloc(4096 * sizeof(wchar_t));
-	wchar_t *inject_path_w;
-	wchar_t *hook_dll_w;
-	bool anti_cheat = use_anticheat(gc);
+	struct inject_launch_context *context = data;
+	struct game_capture *gc = context->gc;
+	const wchar_t *helper = context->helper, *hook = context->hook;
+	wchar_t *command = malloc(2 * VG_DLL_PATH_CAPACITY * sizeof(wchar_t));
+	wchar_t *directory = malloc(VG_DLL_PATH_CAPACITY * sizeof(wchar_t));
+	const bool anti_cheat = context->compatibility;
+	struct vg_injector_child child = {.error = ERROR_INVALID_PARAMETER};
 	PROCESS_INFORMATION pi = {0};
-	STARTUPINFO si = {0};
-	bool success = false;
-
-	os_utf8_to_wcs_ptr(inject_path, 0, &inject_path_w);
-	os_utf8_to_wcs_ptr(hook_dll, 0, &hook_dll_w);
-
+	STARTUPINFOW si = {0};
 	si.cb = sizeof(si);
-
-	swprintf(command_line_w, 4096, L"\"%s\" \"%s\" %lu %lu", inject_path_w, hook_dll_w, (unsigned long)anti_cheat,
-		 anti_cheat ? gc->thread_id : gc->process_id);
-
-	success = !!CreateProcessW(inject_path_w, command_line_w, NULL, NULL, false, CREATE_NO_WINDOW, NULL, NULL, &si,
-				   &pi);
-	if (success) {
-		CloseHandle(pi.hThread);
-		gc->injector_process = pi.hProcess;
-	} else {
-		warn("Failed to create inject helper process: %lu", GetLastError());
+	if (!command || !directory) {
+		child.error = ERROR_NOT_ENOUGH_MEMORY;
+		goto done;
 	}
+	if (wcscpy_s(directory, VG_DLL_PATH_CAPACITY, helper))
+		goto done;
+	wchar_t *slash = wcsrchr(directory, L'\\');
+	if (!slash)
+		goto done;
+	*slash = 0;
+	if (swprintf_s(command, 2 * VG_DLL_PATH_CAPACITY, L"\"%s\" \"%s\" %lu %lu", helper, hook,
+		       (unsigned long)anti_cheat, anti_cheat ? gc->thread_id : gc->process_id) < 0)
+		goto done;
+	// Check the pinned target again; never adopt a helper for a stale target identity.
+	FILETIME creation, exit, kernel, user;
+	if (!GetProcessTimes(gc->target_process, &creation, &exit, &kernel, &user) ||
+	    (((uint64_t)creation.dwHighDateTime << 32) | creation.dwLowDateTime) != gc->injector_creation ||
+	    GetProcessId(gc->target_process) != gc->process_id)
+		goto done;
+	DWORD selected_pid = 0;
+	DWORD selected_tid = GetWindowThreadProcessId(gc->next_window ? gc->next_window : gc->window, &selected_pid);
+	if (selected_pid != gc->process_id || selected_tid != gc->thread_id)
+		goto done;
+	if (CreateProcessW(helper, command, NULL, NULL, false, CREATE_NO_WINDOW, NULL, directory, &si, &pi)) {
+		CloseHandle(pi.hThread);
+		child.handle = pi.hProcess;
+		child.pid = pi.dwProcessId;
+		child.error = 0;
+		info("inject helper process started (pid %lu)", pi.dwProcessId);
+	} else {
+		child.error = GetLastError();
+	}
+done:
+	if (!child.handle)
+		warn("inject helper not started: %lu", (unsigned long)child.error);
+	free(command);
+	free(directory);
+	return child;
+}
 
-	free(command_line_w);
-	bfree(inject_path_w);
-	bfree(hook_dll_w);
-	return success;
+static inline bool create_inject_process(struct game_capture *gc, const wchar_t *helper, const wchar_t *hook,
+					 bool compatibility)
+{
+	struct inject_launch_context context = {gc, helper, hook, compatibility};
+	return vg_injector_start(gc->injector_lease, compatibility, launch_inject_process, &context);
 }
 
 extern char *get_hook_path(bool b64);
 
 static inline bool inject_hook(struct game_capture *gc)
 {
-	bool matching_architecture;
+	if (!vg_injector_can_start(gc->injector_lease))
+		return false;
+	const bool anti_cheat = use_anticheat(gc);
 	bool success = false;
-	char *inject_path;
-	char *hook_path;
-
-	if (gc->process_is_64bit) {
-		inject_path = obs_module_file("inject-helper64.exe");
-	} else {
-		inject_path = obs_module_file("inject-helper32.exe");
-	}
-
-	hook_path = get_hook_path(gc->process_is_64bit);
-
-	if (!check_file_integrity(gc, inject_path, "inject helper")) {
+	char *inject_path = obs_module_file(gc->process_is_64bit ? "inject-helper64.exe" : "inject-helper32.exe");
+	char *hook_path = get_hook_path(gc->process_is_64bit);
+	const WORD machine = gc->process_is_64bit ? IMAGE_FILE_MACHINE_AMD64 : IMAGE_FILE_MACHINE_I386;
+	vg_dll_file *helper = bzalloc(sizeof(*helper)), *hook = bzalloc(sizeof(*hook));
+	if (!helper || !hook || !vg_module_open(inject_path, machine, false, helper) ||
+	    !vg_hook_open(hook_path, machine, hook)) {
+		warn("Rejected inject helper/Hook: expected absolute installed files and matching architecture");
 		goto cleanup;
 	}
-	if (!check_file_integrity(gc, hook_path, "graphics hook")) {
-		goto cleanup;
-	}
-
+	char *helper_utf8 = NULL, *hook_utf8 = NULL;
+	char helper_sha[65], hook_sha[65];
+	os_wcs_to_utf8_ptr(helper->path, 0, &helper_utf8);
+	os_wcs_to_utf8_ptr(hook->path, 0, &hook_utf8);
+	vg_dll_hex(helper->sha256, helper_sha);
+	vg_dll_hex(hook->sha256, hook_sha);
+	info("selected helper '%s' sha256=%s; Hook '%s' sha256=%s", helper_utf8 ? helper_utf8 : "", helper_sha,
+	     hook_utf8 ? hook_utf8 : "", hook_sha);
+	bfree(helper_utf8);
+	bfree(hook_utf8);
+	bool matching_architecture;
 #ifdef _WIN64
 	matching_architecture = gc->process_is_64bit;
 #else
 	matching_architecture = !gc->process_is_64bit;
 #endif
-
-	if (matching_architecture && !use_anticheat(gc)) {
-		info("using direct hook");
-		success = hook_direct(gc, hook_path);
+	if (matching_architecture && !anti_cheat) {
+		char *canonical = NULL;
+		os_wcs_to_utf8_ptr(hook->path, 0, &canonical);
+		if (canonical && vg_injector_claim_direct(gc->injector_lease))
+			success = hook_direct(gc, canonical);
+		bfree(canonical);
 	} else {
-		info("using helper (%s hook)", use_anticheat(gc) ? "compatibility" : "direct");
-		success = create_inject_process(gc, inject_path, hook_path);
+		info("using helper (%s hook)", anti_cheat ? "compatibility" : "direct");
+		success = create_inject_process(gc, helper->path, hook->path, anti_cheat);
 	}
-
 cleanup:
+	if (helper)
+		vg_dll_close(helper);
+	if (hook)
+		vg_dll_close(hook);
+	bfree(helper);
+	bfree(hook);
 	bfree(inject_path);
 	bfree(hook_path);
 	return success;
@@ -1031,6 +1232,26 @@ static bool init_hook(struct game_capture *gc)
 	if (!open_target_process(gc)) {
 		return false;
 	}
+	FILETIME creation, exit, kernel, user;
+	uint64_t born = 0;
+	if (GetProcessTimes(gc->target_process, &creation, &exit, &kernel, &user))
+		born = ((uint64_t)creation.dwHighDateTime << 32) | creation.dwLowDateTime;
+	if (gc->injector_lease) {
+		struct vg_injector_status status = vg_injector_get_status(gc->injector_lease);
+		if (status.target_pid != gc->process_id || status.creation != born)
+			release_injector(gc);
+	}
+	if (born && !gc->injector_lease) {
+		gc->injector_creation = born;
+		gc->injector_lease = vg_injector_acquire(gc->process_id, born);
+	}
+	HANDLE existing = open_event_gc(gc, EVENT_CAPTURE_RESTART);
+	if (existing)
+		CloseHandle(existing);
+	// No fresh injection without a verified identity. A historical Hook remains usable.
+	if (!existing && (!born || !vg_injector_can_start(gc->injector_lease)))
+		return false;
+
 	if (!init_keepalive(gc)) {
 		return false;
 	}
@@ -1147,6 +1368,11 @@ static void get_selected_window(struct game_capture *gc)
 		wchar_t class_w[512];
 		os_utf8_to_wcs(gc->class.array, 0, class_w, 512);
 		window = FindWindowW(class_w, NULL);
+	} else if (gc->priority == WINDOW_PRIORITY_EXE && !dstr_is_empty(&gc->executable)) {
+		/* An executable-only selector has no class or title. The window
+		 * search needs empty strings for these optional criteria. */
+		window = ms_find_window(INCLUDE_MINIMIZED, gc->priority, gc->class.array ? gc->class.array : "",
+					gc->title.array ? gc->title.array : "", gc->executable.array);
 	} else {
 		window = ms_find_window(INCLUDE_MINIMIZED, gc->priority, gc->class.array, gc->title.array,
 					gc->executable.array);
@@ -1185,7 +1411,7 @@ static void try_hook(struct game_capture *gc)
 		}
 
 		if (!init_hook(gc)) {
-			stop_capture(gc);
+			stop_capture(gc, false);
 		}
 	} else {
 		gc->active = false;
@@ -1241,13 +1467,10 @@ static inline bool init_events(struct game_capture *gc)
 
 enum capture_result { CAPTURE_FAIL, CAPTURE_RETRY, CAPTURE_SUCCESS };
 
-static inline bool init_data_map(struct game_capture *gc, HWND window)
+static HANDLE open_data_map(void *context, const wchar_t *name)
 {
-	wchar_t name[64];
-	swprintf(name, 64, SHMEM_TEXTURE "_%" PRIu64 "_", (uint64_t)(uintptr_t)window);
-
-	gc->hook_data_map = open_map_plus_id(gc, name, gc->global_hook_info->map_id);
-	return !!gc->hook_data_map;
+	struct game_capture *gc = context;
+	return gc->is_app ? open_app_map(gc->app_sid, name) : OpenFileMappingW(GC_MAPPING_FLAGS, false, name);
 }
 
 static inline enum capture_result init_capture_data(struct game_capture *gc)
@@ -1264,16 +1487,8 @@ static inline enum capture_result init_capture_data(struct game_capture *gc)
 	CloseHandle(gc->hook_data_map);
 
 	DWORD error = 0;
-	if (!init_data_map(gc, gc->window)) {
-		HWND retry_hwnd = (HWND)(uintptr_t)gc->global_hook_info->window;
-		error = GetLastError();
-
-		/* if there's an error, just override.  some windows don't play
-		 * nice. */
-		if (init_data_map(gc, retry_hwnd)) {
-			error = 0;
-		}
-	}
+	gc->hook_data_map = open_capture_mapping(gc->window, gc->global_hook_info->window, gc->global_hook_info->map_id,
+						 gc->process_is_64bit, gc, open_data_map, GetAncestor, &error);
 
 	if (!gc->hook_data_map) {
 		if (error == 2) {
@@ -1711,8 +1926,8 @@ static void game_capture_tick(void *data, float seconds)
 
 	if (!obs_source_showing(gc->source)) {
 		if (gc->showing) {
-			if (gc->active)
-				stop_capture(gc);
+			if (gc->active || gc->injector_lease)
+				stop_capture(gc, true);
 			gc->showing = false;
 		}
 		return;
@@ -1723,30 +1938,14 @@ static void game_capture_tick(void *data, float seconds)
 
 	if (gc->hook_stop && object_signalled(gc->hook_stop)) {
 		debug("hook stop signal received");
-		stop_capture(gc);
+		stop_capture(gc, true);
 	}
-	if (gc->active && deactivate) {
-		stop_capture(gc);
+	if (deactivate) {
+		stop_capture(gc, true);
 	}
 
 	if (gc->active && !gc->hook_ready && gc->process_id) {
 		gc->hook_ready = open_event_gc(gc, EVENT_HOOK_READY);
-	}
-
-	if (gc->injector_process && object_signalled(gc->injector_process)) {
-		DWORD exit_code = 0;
-
-		GetExitCodeProcess(gc->injector_process, &exit_code);
-		close_handle(&gc->injector_process);
-
-		if (exit_code != 0) {
-			warn("inject process failed: %ld", (long)exit_code);
-			gc->error_acquiring = true;
-
-		} else if (!gc->capturing) {
-			gc->retry_interval = ERROR_RETRY_INTERVAL * hook_rate_to_float(gc->config.hook_rate);
-			stop_capture(gc);
-		}
 	}
 
 	if (gc->hook_ready && object_signalled(gc->hook_ready)) {
@@ -1782,7 +1981,7 @@ static void game_capture_tick(void *data, float seconds)
 		}
 		if (result != CAPTURE_RETRY && !gc->capturing) {
 			gc->retry_interval = ERROR_RETRY_INTERVAL * hook_rate_to_float(gc->config.hook_rate);
-			stop_capture(gc);
+			stop_capture(gc, false);
 		}
 	}
 
@@ -1799,7 +1998,7 @@ static void game_capture_tick(void *data, float seconds)
 		if (!capture_valid(gc)) {
 			info("capture window no longer exists, "
 			     "terminating capture");
-			stop_capture(gc);
+			stop_capture(gc, true);
 		} else {
 			if (gc->copy_texture) {
 				obs_enter_graphics();
@@ -1845,7 +2044,7 @@ static inline void game_capture_render_cursor(struct game_capture *gc)
 	if (!gc->global_hook_info->cx || !gc->global_hook_info->cy)
 		return;
 
-	window = !!gc->global_hook_info->window ? (HWND)(uintptr_t)gc->global_hook_info->window : gc->window;
+	window = !!gc->global_hook_info->window ? capture_window_from_wire(gc->global_hook_info->window) : gc->window;
 
 	DPI_AWARENESS_CONTEXT previous = NULL;
 	if (gc->get_window_dpi_awareness_context != NULL) {

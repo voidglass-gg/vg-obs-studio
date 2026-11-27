@@ -74,6 +74,11 @@ target_link_libraries(
 )
 
 if(OS_WINDOWS)
+  if(ENABLE_UNIT_TESTS)
+    add_executable(voidglass-mux-command-budget mux-command-budget-test.cpp)
+    target_link_libraries(voidglass-mux-command-budget PRIVATE OBS::libobs)
+    target_compile_features(voidglass-mux-command-budget PRIVATE cxx_std_17)
+  endif()
   if(CMAKE_VS_PLATFORM_NAME STREQUAL x64)
     target_sources(obs-ffmpeg PRIVATE texture-amf-opts.hpp texture-amf.cpp)
     target_link_libraries(obs-ffmpeg PRIVATE AMF::AMF)

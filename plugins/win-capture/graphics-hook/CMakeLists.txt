@@ -27,6 +27,7 @@ target_sources(
   PRIVATE
     d3d10-capture.cpp
     d3d11-capture.cpp
+    voidglass-publication.cpp
     d3d12-capture.cpp
     d3d8-capture.cpp
     d3d9-capture.cpp

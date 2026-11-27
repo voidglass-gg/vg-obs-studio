@@ -1,3 +1,4 @@
+#include <voidglass-publication.h>
 #include <d3d10_1.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -190,9 +191,9 @@ static void update_mismatch_count(bool match)
 static HRESULT STDMETHODCALLTYPE hook_present(IDXGISwapChain *swap, UINT sync_interval, UINT flags)
 {
 	if (should_passthrough()) {
-		dxgi_presenting = true;
+		++dxgi_presenting;
 		const HRESULT hr = RealPresent(swap, sync_interval, flags);
-		dxgi_presenting = false;
+		--dxgi_presenting;
 		return hr;
 	}
 
@@ -252,9 +253,9 @@ static HRESULT STDMETHODCALLTYPE hook_present1(IDXGISwapChain1 *swap, UINT sync_
 					       const DXGI_PRESENT_PARAMETERS *params)
 {
 	if (should_passthrough()) {
-		dxgi_presenting = true;
+		++dxgi_presenting;
 		const HRESULT hr = RealPresent1(swap, sync_interval, flags, params);
-		dxgi_presenting = false;
+		--dxgi_presenting;
 		return hr;
 	}
 
@@ -336,6 +337,7 @@ bool hook_dxgi(void)
 	const LONG error = DetourTransactionCommit();
 	const bool success = error == NO_ERROR;
 	if (success) {
+		vg_pub_dxgi_installed();
 		hlog("Hooked IDXGISwapChain::Present");
 		hlog("Hooked IDXGISwapChain::ResizeBuffers");
 		if (RealPresent1) {

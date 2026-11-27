@@ -57,9 +57,13 @@ static inline bool delay_capturing(const struct obs_output *output)
 	return os_atomic_load_bool(&output->delay_capturing);
 }
 
-static inline bool data_capture_ending(const struct obs_output *output)
+static inline void join_data_capture_thread(struct obs_output *output)
 {
-	return os_atomic_load_bool(&output->end_data_capture_thread_active);
+	/* A finished joinable pthread still owns its native handle and cancel event. */
+	if (os_atomic_load_bool(&output->end_data_capture_thread_joinable)) {
+		pthread_join(output->end_data_capture_thread, NULL);
+		os_atomic_set_bool(&output->end_data_capture_thread_joinable, false);
+	}
 }
 
 static inline bool flag_encoded(const struct obs_output *output)
@@ -299,8 +303,7 @@ void obs_output_destroy(obs_output_t *output)
 			obs_output_actual_stop(output, true, 0);
 
 		os_event_wait(output->stopping_event);
-		if (data_capture_ending(output))
-			pthread_join(output->end_data_capture_thread, NULL);
+		join_data_capture_thread(output);
 
 		if (output->service)
 			output->service->output = NULL;
@@ -2571,8 +2574,7 @@ bool obs_output_can_begin_data_capture(const obs_output_t *output, uint32_t flag
 	if (active(output))
 		return false;
 
-	if (data_capture_ending(output))
-		pthread_join(output->end_data_capture_thread, NULL);
+	join_data_capture_thread((obs_output_t *)output);
 
 	return can_begin_data_capture(output);
 }
@@ -2867,7 +2869,6 @@ static void *end_data_capture_thread(void *data)
 	do_output_signal(output, "deactivate");
 	os_atomic_set_bool(&output->active, false);
 	os_event_signal(output->stopping_event);
-	os_atomic_set_bool(&output->end_data_capture_thread_active, false);
 
 	return NULL;
 }
@@ -2904,12 +2905,12 @@ static void obs_output_end_data_capture_internal(obs_output_t *output, bool sign
 	if (flag_video(output))
 		log_frame_info(output);
 
-	if (data_capture_ending(output))
-		pthread_join(output->end_data_capture_thread, NULL);
+	join_data_capture_thread(output);
 
-	os_atomic_set_bool(&output->end_data_capture_thread_active, true);
+	os_atomic_set_bool(&output->end_data_capture_thread_joinable, true);
 	ret = pthread_create(&output->end_data_capture_thread, NULL, end_data_capture_thread, output);
 	if (ret != 0) {
+		os_atomic_set_bool(&output->end_data_capture_thread_joinable, false);
 		blog(LOG_WARNING,
 		     "Failed to create end_data_capture_thread "
 		     "for output '%s'!",

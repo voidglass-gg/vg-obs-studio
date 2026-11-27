@@ -35,6 +35,8 @@ struct update_info {
 
 	pthread_t thread;
 	bool thread_created;
+	volatile bool cancel;
+	bool download_failed;
 	char *log_prefix;
 };
 
@@ -43,6 +45,8 @@ void update_info_destroy(struct update_info *info)
 	if (!info)
 		return;
 
+	/* The worker owns all curl operations until it has exited. */
+	os_atomic_set_bool(&info->cancel, true);
 	if (info->thread_created)
 		pthread_join(info->thread, NULL);
 
@@ -53,6 +57,8 @@ void update_info_destroy(struct update_info *info)
 	bfree(info->cache);
 	bfree(info->local);
 	bfree(info->url);
+	bfree(info->etag_local);
+	bfree(info->etag_remote);
 
 	if (info->header)
 		curl_slist_free_all(info->header);
@@ -67,8 +73,61 @@ void update_info_destroy(struct update_info *info)
 	bfree(info);
 }
 
+static bool update_cancelled(struct update_info *info)
+{
+	return os_atomic_load_bool(&info->cancel);
+}
+
+static int http_progress(void *param, curl_off_t total, curl_off_t now, curl_off_t upload_total, curl_off_t uploaded)
+{
+	UNUSED_PARAMETER(total);
+	UNUSED_PARAMETER(now);
+	UNUSED_PARAMETER(upload_total);
+	UNUSED_PARAMETER(uploaded);
+	return update_cancelled(param) ? 1 : 0;
+}
+
+/* Poll cancellation even when an idle transfer has no progress callbacks.
+ * No other thread may remove/clean up either handle. Bounded DNS with
+ * CURLOPT_NOSIGNAL requires an asynchronous resolver in libcurl. */
+static CURLcode perform_request(struct update_info *info)
+{
+	CURLM *multi = curl_multi_init();
+	CURLcode result = CURLE_FAILED_INIT;
+	int running = 0;
+	if (!multi)
+		return result;
+	if (curl_multi_add_handle(multi, info->curl) != CURLM_OK) {
+		curl_multi_cleanup(multi);
+		return result;
+	}
+
+	while (!update_cancelled(info)) {
+		if (curl_multi_perform(multi, &running) != CURLM_OK)
+			break;
+		if (!running) {
+			int remaining;
+			CURLMsg *message;
+			while ((message = curl_multi_info_read(multi, &remaining))) {
+				if (message->msg == CURLMSG_DONE && message->easy_handle == info->curl)
+					result = message->data.result;
+			}
+			break;
+		}
+		if (curl_multi_poll(multi, NULL, 0, 50, NULL) != CURLM_OK)
+			break;
+	}
+	if (update_cancelled(info))
+		result = CURLE_ABORTED_BY_CALLBACK;
+	curl_multi_remove_handle(multi, info->curl);
+	curl_multi_cleanup(multi);
+	return result;
+}
+
 static size_t http_write(char *ptr, size_t size, size_t nmemb, void *info_param)
 {
+	if (update_cancelled(info_param))
+		return 0;
 	size_t total = size * nmemb;
 	if (total) {
 		struct update_info *info = info_param;
@@ -80,6 +139,11 @@ static size_t http_write(char *ptr, size_t size, size_t nmemb, void *info_param)
 
 static size_t http_header(char *buffer, size_t size, size_t nitems, void *info_param)
 {
+	if (update_cancelled(info_param))
+		return 0;
+	/* File responses must not replace the package ETag saved after commit. */
+	if (((struct update_info *)info_param)->remote_url)
+		return nitems * size;
 	if (!strncmp(buffer, "ETag: ", 6)) {
 		char *etag = buffer + 6;
 		if (*etag) {
@@ -96,6 +160,7 @@ static size_t http_header(char *buffer, size_t size, size_t nitems, void *info_p
 			if (p)
 				*p = 0;
 
+			bfree(info->etag_remote);
 			info->etag_remote = etag_clean;
 		}
 	}
@@ -107,6 +172,8 @@ static bool do_http_request(struct update_info *info, const char *url, long *res
 	CURLcode code;
 	uint8_t null_terminator = 0;
 
+	if (update_cancelled(info))
+		return false;
 	da_resize(info->file_data, 0);
 	curl_easy_setopt(info->curl, CURLOPT_URL, url);
 	curl_easy_setopt(info->curl, CURLOPT_HTTPHEADER, info->header);
@@ -115,6 +182,11 @@ static bool do_http_request(struct update_info *info, const char *url, long *res
 	curl_easy_setopt(info->curl, CURLOPT_WRITEDATA, info);
 	curl_easy_setopt(info->curl, CURLOPT_FAILONERROR, 1L);
 	curl_easy_setopt(info->curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(info->curl, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
+	curl_easy_setopt(info->curl, CURLOPT_TIMEOUT_MS, 30000L);
+	curl_easy_setopt(info->curl, CURLOPT_NOPROGRESS, 0L);
+	curl_easy_setopt(info->curl, CURLOPT_XFERINFOFUNCTION, http_progress);
+	curl_easy_setopt(info->curl, CURLOPT_XFERINFODATA, info);
 	curl_easy_setopt(info->curl, CURLOPT_ACCEPT_ENCODING, "");
 	curl_obs_set_revoke_setting(info->curl);
 
@@ -124,9 +196,11 @@ static bool do_http_request(struct update_info *info, const char *url, long *res
 		curl_easy_setopt(info->curl, CURLOPT_HEADERDATA, info);
 	}
 
-	code = curl_easy_perform(info->curl);
+	code = perform_request(info);
+	if (update_cancelled(info))
+		return false;
 	if (code != CURLE_OK) {
-		warn("Remote update of URL \"%s\" failed: %s", url, info->error);
+		warn("Remote update of URL \"%s\" failed: %s", url, info->error[0] ? info->error : curl_easy_strerror(code));
 		return false;
 	}
 
@@ -178,7 +252,8 @@ static bool init_update(struct update_info *info)
 	info->cache_package = get_package(info->cache, "package.json");
 
 	obs_data_t *metadata = get_package(info->cache, "meta.json");
-	if (metadata) {
+	if (metadata && info->cache_package && obs_data_has_user_value(metadata, "version") &&
+	    obs_data_get_int(metadata, "version") == obs_data_get_int(info->cache_package, "version")) {
 		const char *etag = obs_data_get_string(metadata, "etag");
 		if (etag) {
 			struct dstr if_none_match = {0};
@@ -191,9 +266,8 @@ static bool init_update(struct update_info *info)
 
 			dstr_free(&if_none_match);
 		}
-
-		obs_data_release(metadata);
 	}
+	obs_data_release(metadata);
 
 	dstr_copy(&user_agent, "User-Agent: ");
 	dstr_cat(&user_agent, info->user_agent);
@@ -204,19 +278,28 @@ static bool init_update(struct update_info *info)
 	return true;
 }
 
-static void copy_local_to_cache(struct update_info *info, const char *file)
+static bool copy_local_to_cache(struct update_info *info, const char *file)
 {
 	char *local_file_path = get_path(info->local, file);
 	char *cache_file_path = get_path(info->cache, file);
 	char *temp_file_path = get_path(info->temp, file);
+	bool success = false;
 
-	os_copyfile(local_file_path, temp_file_path);
-	os_unlink(cache_file_path);
-	os_rename(temp_file_path, cache_file_path);
+	/* A previous interrupted copy may have left a staging file. */
+	if (os_file_exists(temp_file_path) && os_unlink(temp_file_path) != 0) {
+		warn("Could not remove staging file '%s'", temp_file_path);
+	} else if (os_copyfile(local_file_path, temp_file_path) != 0) {
+		warn("Could not stage local file '%s'", local_file_path);
+	} else if (os_rename(temp_file_path, cache_file_path) != 0) {
+		warn("Could not commit local file '%s'", cache_file_path);
+	} else {
+		success = true;
+	}
 
 	bfree(local_file_path);
 	bfree(cache_file_path);
 	bfree(temp_file_path);
+	return success;
 }
 
 static void enum_files(obs_data_t *package, bool (*enum_func)(void *param, obs_data_t *file), void *param)
@@ -270,8 +353,10 @@ static bool update_files_to_local(void *param, obs_data_t *local_file)
 					.version = (int)obs_data_get_int(local_file, "version")};
 
 	enum_files(info->cache_package, newer_than_cache, &data);
-	if (data.newer || !data.found)
-		copy_local_to_cache(info, data.name);
+	if ((data.newer || !data.found) && !copy_local_to_cache(info, data.name)) {
+		info->download_failed = true;
+		return false;
+	}
 
 	return true;
 }
@@ -287,7 +372,8 @@ static int update_local_version(struct update_info *info)
 	/* if local cached version is out of date, copy new version */
 	if (cache_version < local_version) {
 		enum_files(info->local_package, update_files_to_local, info);
-		copy_local_to_cache(info, "package.json");
+		if (info->download_failed || !copy_local_to_cache(info, "package.json"))
+			return -1;
 
 		obs_data_release(info->cache_package);
 		obs_data_addref(info->local_package);
@@ -308,30 +394,52 @@ static inline bool do_relative_http_request(struct update_info *info, const char
 	return success && response_code == 200;
 }
 
-static inline void write_file_data(struct update_info *info, const char *base_path, const char *file)
+static bool write_cache_data(struct update_info *info, const char *base_path, const char *file,
+			     const char *data, size_t len)
 {
 	char *full_path = get_path(base_path, file);
-	os_quick_write_utf8_file(full_path, (char *)info->file_data.array, info->file_data.num - 1, false);
+	FILE *output = os_fopen(full_path, "wb");
+	bool success = false;
+
+	if (output) {
+		success = !len || fwrite(data, len, 1, output) == 1;
+		if (fflush(output) != 0)
+			success = false;
+		if (fclose(output) != 0)
+			success = false;
+	}
+	if (!success)
+		warn("Could not write staging file '%s'", full_path);
 	bfree(full_path);
+	return success;
 }
 
-static inline void replace_file(const char *src_base_path, const char *dst_base_path, const char *file)
+static inline bool write_file_data(struct update_info *info, const char *base_path, const char *file)
+{
+	return write_cache_data(info, base_path, file, (char *)info->file_data.array, info->file_data.num - 1);
+}
+
+static inline bool replace_file(struct update_info *info, const char *src_base_path, const char *dst_base_path,
+				const char *file)
 {
 	char *src_path = get_path(src_base_path, file);
 	char *dst_path = get_path(dst_base_path, file);
-
-	if (src_path && dst_path) {
-		os_unlink(dst_path);
-		os_rename(src_path, dst_path);
-	}
+	/* os_rename replaces the destination; do not unlink the previous cache. */
+	bool success = src_path && dst_path && os_rename(src_path, dst_path) == 0;
+	if (!success)
+		warn("Could not commit cache file '%s'", dst_path);
 
 	bfree(dst_path);
 	bfree(src_path);
+	return success;
 }
 
 static bool update_remote_files(void *param, obs_data_t *remote_file)
 {
 	struct update_info *info = param;
+
+	if (update_cancelled(info))
+		return false;
 
 	struct file_update_data data = {.name = obs_data_get_string(remote_file, "name"),
 					.version = (int)obs_data_get_int(remote_file, "version")};
@@ -340,9 +448,13 @@ static bool update_remote_files(void *param, obs_data_t *remote_file)
 	if (!data.newer && data.found)
 		return true;
 
-	if (!do_relative_http_request(info, info->remote_url, data.name))
-		return true;
+	if (!do_relative_http_request(info, info->remote_url, data.name)) {
+		info->download_failed = true;
+		return !update_cancelled(info);
+	}
 
+	if (update_cancelled(info))
+		return false;
 	if (info->callback) {
 		struct file_download_data download_data;
 		bool confirm;
@@ -356,35 +468,38 @@ static bool update_remote_files(void *param, obs_data_t *remote_file)
 		info->file_data.da = download_data.buffer.da;
 
 		if (!confirm) {
+			info->download_failed = true;
 			info("Update file '%s' (version %d) rejected", data.name, data.version);
 			return true;
 		}
 	}
 
-	write_file_data(info, info->temp, data.name);
-	replace_file(info->temp, info->cache, data.name);
+	if (update_cancelled(info))
+		return false;
+	if (!write_file_data(info, info->temp, data.name) ||
+	    !replace_file(info, info->temp, info->cache, data.name)) {
+		info->download_failed = true;
+		return false;
+	}
 
 	info("Successfully updated file '%s' (version %d)", data.name, data.version);
 	return true;
 }
 
-static void update_save_metadata(struct update_info *info)
+static bool update_save_metadata(struct update_info *info, int cache_version)
 {
-	struct dstr path = {0};
-
 	if (!info->etag_remote)
-		return;
+		return true;
 
-	dstr_copy(&path, info->cache);
-	dstr_cat(&path, "meta.json");
-
-	obs_data_t *data;
-	data = obs_data_create();
+	obs_data_t *data = obs_data_create();
 	obs_data_set_string(data, "etag", info->etag_remote);
-	obs_data_save_json(data, path.array);
+	/* Ignore legacy/unmatched ETags on load, including poisoned E3C caches. */
+	obs_data_set_int(data, "version", cache_version);
+	const char *json = obs_data_get_json(data);
+	bool success = json && write_cache_data(info, info->temp, "meta.json", json, strlen(json)) &&
+		       replace_file(info, info->temp, info->cache, "meta.json");
 	obs_data_release(data);
-
-	dstr_free(&path);
+	return success;
 }
 
 static void update_remote_version(struct update_info *info, int cur_version)
@@ -403,8 +518,6 @@ static void update_remote_version(struct update_info *info, int cur_version)
 		return;
 	}
 
-	update_save_metadata(info);
-
 	info->remote_package = obs_data_create_from_json((char *)info->file_data.array);
 	if (!info->remote_package) {
 		warn("Failed to initialize remote package json");
@@ -412,10 +525,14 @@ static void update_remote_version(struct update_info *info, int cur_version)
 	}
 
 	remote_version = (int)obs_data_get_int(info->remote_package, "version");
-	if (remote_version <= cur_version)
+	if (remote_version <= cur_version) {
+		if (!update_cancelled(info) && !update_save_metadata(info, cur_version))
+			warn("Could not refresh cache metadata");
 		return;
+	}
 
-	write_file_data(info, info->temp, "package.json");
+	if (!write_file_data(info, info->temp, "package.json"))
+		return;
 
 	info->remote_url = obs_data_get_string(info->remote_package, "url");
 	if (!info->remote_url) {
@@ -426,7 +543,14 @@ static void update_remote_version(struct update_info *info, int cur_version)
 	/* download new files */
 	enum_files(info->remote_package, update_remote_files, info);
 
-	replace_file(info->temp, info->cache, "package.json");
+	/* Preserve the previous manifest/ETag so a failed or cancelled download
+	 * is retried on the next run rather than skipped as up to date. */
+	if (update_cancelled(info) || info->download_failed)
+		return;
+	if (!replace_file(info, info->temp, info->cache, "package.json"))
+		return;
+	if (!update_save_metadata(info, remote_version))
+		return;
 
 	info("Successfully updated package (version %d)", remote_version);
 	return;
@@ -441,13 +565,9 @@ static void *update_thread(void *data)
 		return NULL;
 
 	cur_version = update_local_version(info);
-	update_remote_version(info, cur_version);
+	if (cur_version >= 0 && !update_cancelled(info))
+		update_remote_version(info, cur_version);
 	os_rmdir(info->temp);
-
-	if (info->etag_local)
-		bfree(info->etag_local);
-	if (info->etag_remote)
-		bfree(info->etag_remote);
 
 	return NULL;
 }
@@ -508,7 +628,7 @@ static void *single_file_thread(void *data)
 
 	if (!do_http_request(info, info->url, &response_code))
 		return NULL;
-	if (!info->file_data.array || !info->file_data.array[0])
+	if (update_cancelled(info) || !info->file_data.array || !info->file_data.array[0])
 		return NULL;
 
 	download_data.name = info->url;
