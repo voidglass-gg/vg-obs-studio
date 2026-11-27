@@ -20,6 +20,7 @@
 #include "compat-helpers.h"
 #include "graphics-hook-info.h"
 #include "graphics-hook-ver.h"
+#include "capture-mapping.h"
 #include "cursor-capture.h"
 #include "app-helpers.h"
 #include "audio-helpers.h"
@@ -1466,13 +1467,10 @@ static inline bool init_events(struct game_capture *gc)
 
 enum capture_result { CAPTURE_FAIL, CAPTURE_RETRY, CAPTURE_SUCCESS };
 
-static inline bool init_data_map(struct game_capture *gc, HWND window)
+static HANDLE open_data_map(void *context, const wchar_t *name)
 {
-	wchar_t name[64];
-	swprintf(name, 64, SHMEM_TEXTURE "_%" PRIu64 "_", (uint64_t)(uintptr_t)window);
-
-	gc->hook_data_map = open_map_plus_id(gc, name, gc->global_hook_info->map_id);
-	return !!gc->hook_data_map;
+	struct game_capture *gc = context;
+	return gc->is_app ? open_app_map(gc->app_sid, name) : OpenFileMappingW(GC_MAPPING_FLAGS, false, name);
 }
 
 static inline enum capture_result init_capture_data(struct game_capture *gc)
@@ -1489,16 +1487,8 @@ static inline enum capture_result init_capture_data(struct game_capture *gc)
 	CloseHandle(gc->hook_data_map);
 
 	DWORD error = 0;
-	if (!init_data_map(gc, gc->window)) {
-		HWND retry_hwnd = (HWND)(uintptr_t)gc->global_hook_info->window;
-		error = GetLastError();
-
-		/* if there's an error, just override.  some windows don't play
-		 * nice. */
-		if (init_data_map(gc, retry_hwnd)) {
-			error = 0;
-		}
-	}
+	gc->hook_data_map = open_capture_mapping(gc->window, gc->global_hook_info->window, gc->global_hook_info->map_id,
+						 gc->process_is_64bit, gc, open_data_map, GetAncestor, &error);
 
 	if (!gc->hook_data_map) {
 		if (error == 2) {
@@ -2054,7 +2044,7 @@ static inline void game_capture_render_cursor(struct game_capture *gc)
 	if (!gc->global_hook_info->cx || !gc->global_hook_info->cy)
 		return;
 
-	window = !!gc->global_hook_info->window ? (HWND)(uintptr_t)gc->global_hook_info->window : gc->window;
+	window = !!gc->global_hook_info->window ? capture_window_from_wire(gc->global_hook_info->window) : gc->window;
 
 	DPI_AWARENESS_CONTEXT previous = NULL;
 	if (gc->get_window_dpi_awareness_context != NULL) {
