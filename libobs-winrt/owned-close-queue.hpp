@@ -1,12 +1,14 @@
 #pragma once
 
 #include <array>
+#include <bitset>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -16,18 +18,21 @@ namespace wgc {
 // Capacity covers live generations AND pending/in-progress closes. Reserving
 // before resource creation guarantees retirement never allocates or falls back
 // to calling an OS Close on the producer/graphics thread.
-template<class Payload, class Policy, size_t Capacity> class OwnedCloseQueue {
+template<class Payload, class Policy, size_t Capacity, class OwnerRef = std::nullptr_t> class OwnedCloseQueue {
 	static_assert(Capacity > 0);
 	static_assert(std::is_nothrow_default_constructible_v<Payload>);
 	static_assert(std::is_nothrow_move_assignable_v<Payload>);
+	static_assert(std::is_nothrow_move_constructible_v<OwnerRef>);
 	static_assert(noexcept(std::declval<Policy &>().Close(std::declval<Payload &>())));
 	enum class State { Free, Live, Pending, Closing };
 	struct Slot {
 		Payload payload{};
+		OwnerRef owner_ref{nullptr};
 		State state = State::Free;
 		uint64_t ticket = 0;
 	};
 	std::array<Slot, Capacity> slots_{};
+	std::bitset<Capacity> owner_refs_;
 	Policy policy_;
 	std::mutex mutex_;
 	std::condition_variable ready_, work_, drained_;
@@ -185,6 +190,33 @@ public:
 			counts.closing += slot.state == State::Closing;
 		}
 		return counts;
+	}
+	// Only the creating dispatcher calls these two methods. Reserve has
+	// already acquired an idle slot, so its previous worker Close is complete.
+	OwnerRef &ResetOwnerReference(const Lease &lease) noexcept
+	{
+		if (!lease)
+			std::terminate();
+		auto &ref = slots_[lease.index].owner_ref;
+		ref = nullptr;
+		owner_refs_.set(lease.index);
+		return ref;
+	}
+	void CollectOwnerReferences() noexcept
+	{
+		if (owner_refs_.none())
+			return;
+		// Move only under the lock. A COM destructor may call back into Windows.
+		std::array<std::optional<OwnerRef>, Capacity> retired;
+		{
+			std::lock_guard lock(mutex_);
+			for (size_t i = 0; i < Capacity; ++i) {
+				if (owner_refs_[i] && slots_[i].state == State::Free) {
+					retired[i].emplace(std::move(slots_[i].owner_ref));
+					owner_refs_.reset(i);
+				}
+			}
+		}
 	}
 	// Called outside graphics, before dispatcher/apartment/module destruction.
 	// A timeout reports INCOMPLETE, but MUST NOT authorize unload or detach.

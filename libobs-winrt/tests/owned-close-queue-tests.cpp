@@ -47,6 +47,7 @@ struct Resource {
 	}
 };
 struct Payload {
+	std::shared_ptr<int> session_item;
 	std::unique_ptr<Resource> session, pool, partial_reference;
 	bool close_error = false;
 };
@@ -209,6 +210,61 @@ static void FailedInitializationAndPartialCreation()
 		"Partial references and Close-error final releases stay on the worker, with no leaked reservation");
 }
 
+static void CaptureItemOutlivesWorkerClose()
+{
+	State state;
+	wgc::OwnedCloseQueue<Payload, Policy, 1, std::shared_ptr<int>> queue{Policy{&state}};
+	const auto owner = std::this_thread::get_id();
+	std::atomic<unsigned> releases{0};
+	std::atomic<bool> wrong_thread{false};
+	auto new_item = [&] {
+		return std::shared_ptr<int>(new int{}, [&](int *item) {
+			delete item;
+			if (std::this_thread::get_id() != owner)
+				wrong_thread = true;
+			(void)queue.Snapshot(); // Final release must run outside the queue mutex.
+			++releases;
+		});
+	};
+	Check(queue.Start(), "Worker starts for item ownership test");
+	auto first = queue.Reserve();
+	auto &first_item = queue.ResetOwnerReference(first);
+	first_item = new_item();
+	auto session = std::make_unique<Resource>(state, 1);
+	queue.Retire(first, [&](Payload &p) noexcept {
+		p.session = std::move(session);
+		p.session_item = first_item;
+	});
+	const bool close_started = state.WaitEntered();
+	queue.CollectOwnerReferences();
+	const bool retained_while_closing = releases == 0;
+	state.Release();
+	const auto deadline = std::chrono::steady_clock::now() + 2s;
+	auto second = queue.Reserve();
+	while (!second && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::yield();
+		second = queue.Reserve();
+	}
+	const bool reused_before_tick = static_cast<bool>(second);
+	const bool retained_after_close = releases == 0;
+	if (second) {
+		auto &second_item = queue.ResetOwnerReference(second);
+		second_item = new_item();
+		queue.CollectOwnerReferences();
+		queue.Retire(second, [](Payload &) noexcept {}); // Partial start, no session.
+	}
+	const bool released_on_reuse = releases == 1;
+	const bool joined = queue.StopAndJoin(2s, [] {});
+	const bool held_at_join = releases == 1;
+	queue.CollectOwnerReferences();
+	queue.CollectOwnerReferences();
+	Check(close_started && retained_while_closing && retained_after_close,
+	      "Session Close cannot perform the final release of its dispatcher-owned item");
+	Check(reused_before_tick && released_on_reuse, "A reused slot releases only its completed predecessor");
+	Check(joined && held_at_join && releases == 2 && !wrong_thread,
+	      "Tick or shutdown releases each item exactly once on its creating dispatcher");
+}
+
 struct ConsentReply {
 	enum class Status { Started, Completed, Canceled, Error } status = Status::Started;
 	enum class Access { Denied, Allowed } access = Access::Denied;
@@ -289,6 +345,7 @@ int main()
 		BlockedCloseKeepsProducerAndControlResponsive();
 		WarningThresholdCannotAuthorizeUnload();
 		FailedInitializationAndPartialCreation();
+		CaptureItemOutlivesWorkerClose();
 		std::cout << "Owned WGC Close: " << checks << " CPU checks PASS; no OBS, WinRT, GPU, window or capture\n";
 		return 0;
 	} catch (const std::exception &error) {

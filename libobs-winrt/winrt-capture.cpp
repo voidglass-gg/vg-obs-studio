@@ -50,7 +50,6 @@ using capture_access_operation = decltype(winrt::Windows::Graphics::Capture::Gra
 struct window_close_bundle {
 	winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool pool{nullptr};
 	winrt::Windows::Graphics::Capture::GraphicsCaptureSession session{nullptr};
-	winrt::Windows::Graphics::Capture::GraphicsCaptureItem item{nullptr};
 	winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice device{nullptr};
 	ComPtr<ID3D11DeviceContext> context;
 	ComPtr<IDXGIDevice> dxgi_device;
@@ -78,13 +77,23 @@ struct window_close_policy {
 		// not a bound on OS RPC; neither call runs on graphics/control.
 		close_capture_resource(value.pool);
 		close_capture_resource(value.session);
-		// The queue clears ALL remaining references on this MTA worker before
-		// returning its reserved slot. Never call Copy/Flush/ClearState here.
+		// The queue clears the rest of this bundle before returning the slot.
 	}
 	void Uninitialize() noexcept { winrt::uninit_apartment(); }
 };
-using window_close_queue = wgc::OwnedCloseQueue<window_close_bundle, window_close_policy, 32>;
+// GraphicsCaptureItem's internal Closed notification runs on the creating
+// dispatcher, even with CreateFreeThreaded and no application event handler.
+// Keep the item alive until the worker releases the session, then release the
+// item on that same dispatcher so its destructor cannot race the notification.
+using window_close_queue = wgc::OwnedCloseQueue<window_close_bundle, window_close_policy, 32,
+					       winrt::Windows::Graphics::Capture::GraphicsCaptureItem>;
 static window_close_queue window_closes;
+static thread_local bool window_capture_owner = false;
+
+static void collect_window_items(void *, float)
+{
+	window_closes.CollectOwnerReferences();
+}
 
 extern "C" EXPORT BOOL winrt_capture_supported()
 try {
@@ -181,6 +190,7 @@ struct winrt_capture {
 	 * Poll only on the graphics task thread; taking its lock on another thread
 	 * does not make that thread the capture owner. */
 	bool free_threaded = false;
+	bool rebuild_on_owner = false;
 	bool polling = false;
 	uint64_t generation = 0;
 	DXGI_FORMAT pool_format = DXGI_FORMAT_UNKNOWN;
@@ -311,6 +321,7 @@ struct winrt_capture {
 
 void winrt_capture::close_window_capture() noexcept
 {
+	rebuild_on_owner = false;
 	active = FALSE;
 	texture_written = false;
 	texture_width = texture_height = 0;
@@ -319,7 +330,6 @@ void winrt_capture::close_window_capture() noexcept
 		window_closes.Retire(close_lease, [&](window_close_bundle &owned) noexcept {
 			owned.pool = std::move(frame_pool);
 			owned.session = std::move(session);
-			owned.item = std::move(item);
 			owned.device = std::move(device);
 			owned.context = std::move(context);
 			owned.dxgi_device = std::move(capture_dxgi_device);
@@ -382,6 +392,8 @@ void winrt_capture::poll_frame() noexcept
 	if (!obs_in_task_thread(OBS_TASK_GRAPHICS))
 		return;
 	capture_graphics_scope graphics(true);
+	if (rebuild_on_owner)
+		start_window_capture(static_cast<ID3D11Device *>(gs_get_device_obj()));
 	if (active)
 		border_access.Poll(session);
 	if (!free_threaded || polling || !active || !frame_pool)
@@ -563,6 +575,12 @@ winrt_capture_create_item(IGraphicsCaptureItemInterop *const interop_factory, HW
 bool winrt_capture::start_window_capture(ID3D11Device *d3d_device) noexcept
 {
 	close_window_capture();
+	// Device rebuild callbacks can run on another thread holding graphics.
+	// The next graphics poll uses the current device and its own dispatcher.
+	if (!window_capture_owner) {
+		rebuild_on_owner = true;
+		return true;
+	}
 	try {
 		DWORD pid = 0;
 		const DWORD tid = GetWindowThreadProcessId(window, &pid);
@@ -575,26 +593,25 @@ bool winrt_capture::start_window_capture(ID3D11Device *d3d_device) noexcept
 			     pending.live, pending.pending, pending.closing);
 			return false;
 		}
-		// Reserve before the first WinRT object. Store partial references in
-		// the capture so catch can transfer them; no sole local reference is
-		// released on graphics when a later creation step throws.
+		// The reservation also covers partial creation if a later call throws.
+		auto &window_item = window_closes.ResetOwnerReference(close_lease);
 		capture_factory = winrt::get_activation_factory<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>();
 		capture_interop = capture_factory.as<IGraphicsCaptureItemInterop>();
 		winrt::check_hresult(capture_interop->CreateForWindow(
 			window, winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
-			reinterpret_cast<void **>(winrt::put_abi(item))));
+			reinterpret_cast<void **>(winrt::put_abi(window_item))));
 		winrt::check_hresult(d3d_device->QueryInterface(&capture_dxgi_device));
 		winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(capture_dxgi_device.Get(), capture_inspectable.put()));
 		device = capture_inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
 		d3d_device->GetImmediateContext(&context);
-		last_size = item.Size();
+		last_size = window_item.Size();
 		if (last_size.Width <= 0 || last_size.Height <= 0)
 			winrt::throw_hresult(E_INVALIDARG);
 		pool_format = get_pixel_format(window, nullptr, force_sdr);
 		frame_pool = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
 			device, static_cast<winrt::Windows::Graphics::DirectX::DirectXPixelFormat>(pool_format), 2,
 			last_size);
-		session = frame_pool.CreateCaptureSession(item);
+		session = frame_pool.CreateCaptureSession(window_item);
 		if (capture_cursor)
 			session.IsCursorCaptureEnabled(cursor_visible);
 		session.StartCapture();
@@ -844,7 +861,10 @@ extern "C" EXPORT BOOL winrt_capture_show_cursor(struct winrt_capture *capture, 
 	try {
 		if (capture->capture_cursor) {
 			if (capture->cursor_visible != visible) {
-				capture->session.IsCursorCaptureEnabled(visible);
+				if (capture->session)
+					capture->session.IsCursorCaptureEnabled(visible);
+				else if (!capture->rebuild_on_owner)
+					return FALSE;
 				capture->cursor_visible = visible;
 			}
 		}
@@ -938,8 +958,10 @@ extern "C" EXPORT uint32_t winrt_capture_height(const struct winrt_capture *capt
 
 extern "C" EXPORT void winrt_capture_thread_start()
 {
+	window_capture_owner = true;
 	if (!window_closes.Start())
 		blog(LOG_ERROR, "WGC Close worker unavailable; new FreeThreaded Window captures will be refused");
+	obs_add_tick_callback(collect_window_items, nullptr);
 	struct winrt_capture *capture = capture_list;
 	void *const device = gs_get_device_obj();
 	while (capture) {
@@ -950,14 +972,15 @@ extern "C" EXPORT void winrt_capture_thread_start()
 
 extern "C" EXPORT void winrt_capture_thread_stop()
 {
+	obs_remove_tick_callback(collect_window_items, nullptr);
 	struct winrt_capture *capture = capture_list;
 	while (capture) {
 		winrt_capture_device_loss_release(capture);
 		capture = capture->next;
 	}
 	// obs-video invokes this OUTSIDE graphics, before dispatcher/COM teardown
-	// and before closing its module handle. Every retired generation and its
-	// final Release must finish before the worker can uninitialize or unload.
+	// and before closing its module handle. Join the worker before releasing
+	// the final capture items on the dispatcher that created them.
 	const bool within_warning_threshold = window_closes.StopAndJoin(std::chrono::seconds(5), [] {
 		const auto pending = window_closes.Snapshot();
 		blog(LOG_WARNING, "WGC Close drain INCOMPLETE: still waiting for owned drain after5000ms (live=%zu pending=%zu closing=%zu); retaining join and module lifetime",
@@ -965,4 +988,6 @@ extern "C" EXPORT void winrt_capture_thread_stop()
 	});
 	if (!within_warning_threshold)
 		blog(LOG_INFO, "WGC Close drain completed; worker joined after warning threshold");
+	collect_window_items(nullptr, 0.0f);
+	window_capture_owner = false;
 }
